@@ -176,15 +176,25 @@ class ProfileService:
     ) -> ProfileDocumentExport:
         manifest = self.get_profile(identifier)
         jsonld_context = self.profile_repository.load_jsonld_context(identifier)
-        return export_profile_document(
+        # A shapes problem must only cost the SHACL report, never the documents.
+        shacl_error: str | None = None
+        try:
+            shacl_shapes: Graph | None = self.load_shacl_shape_graph(identifier)
+        except Exception as exc:
+            shacl_shapes = None
+            shacl_error = f"SHACL shapes unavailable: {type(exc).__name__}: {exc}"
+        export = export_profile_document(
             document=document,
             jsonld_context=jsonld_context,
             target_class=manifest.target_class,
             json_schema=self.profile_repository.load_json_schema(identifier),
-            shacl_shapes=self.load_shacl_shape_graph(identifier),
+            shacl_shapes=shacl_shapes,
             profile_identifier=identifier,
             profile_version=manifest.version,
         )
+        if shacl_error is not None:
+            export.errors["shacl"] = shacl_error
+        return export
 
     async def _load_schema_from_upload(
         self,

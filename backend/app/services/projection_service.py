@@ -6828,7 +6828,15 @@ class ProjectionService:
         self,
         data_package_id: str,
         state: ExtractionRunState,
+        *,
+        warnings: list[str] | None = None,
     ) -> None:
+        """Persist the run state's artifacts, including document exports.
+
+        Pass ``warnings`` when the caller saves that list as
+        ``extraction_warnings.json`` afterwards: export warnings are then merged
+        into it in place instead of into the file, so they are not overwritten.
+        """
         if self.output_repository is None:
             return
         chat_model = state.chat_model
@@ -6914,12 +6922,15 @@ class ProjectionService:
             chat_model=chat_model,
             chunking_strategy=chunking_strategy,
         )
-        self._persist_document_exports(
+        export_warnings, superseded = self._persist_document_exports(
             data_package_id,
             state,
             draft=state.generated_reconstructed_draft,
             curated=state.curated_document,
+            persist_warnings=warnings is None,
         )
+        if warnings is not None:
+            warnings[:] = self._merge_export_warnings(warnings, export_warnings, superseded)
 
     def _persist_document_exports(
         self,
@@ -6934,8 +6945,9 @@ class ProjectionService:
 
         Export failures never interrupt the workflow: they are logged and
         returned as warnings. Returns the new warnings and the warning prefixes
-        they supersede (the previous SHACL summary of each exported document);
-        by default both are merged into ``extraction_warnings.json``.
+        they supersede (earlier SHACL summaries and export failures of each
+        exported document); by default both are merged into
+        ``extraction_warnings.json``.
         """
         if self.output_repository is None or not state.profile_identifier:
             return [], ()
@@ -6945,7 +6957,15 @@ class ProjectionService:
             if document is None:
                 continue
             shacl_prefix = f"SHACL validation of {document_name} document"
-            superseded.append(shacl_prefix)
+            # Warnings about this document's exports always reflect the latest
+            # export: earlier SHACL summaries and failure messages are replaced.
+            superseded.extend(
+                (
+                    shacl_prefix,
+                    f"Export of {document_name} document",
+                    f"Writing {document_name} document exports",
+                )
+            )
             try:
                 export = self.profile_service.export_document_formats(
                     identifier=state.profile_identifier,

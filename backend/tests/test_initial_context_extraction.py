@@ -52,6 +52,7 @@ from app.domain.extraction import (
     build_extraction_overview_prompt,
     build_extraction_overview_prompt_components,
 )
+from app.domain.profiles import ProfileDocumentExport, ShaclValidationReport
 from app.domain.semantics import CompactVocabResource, VocabGraphStatement, VocabQuery, VocabQueryResult, VocabSchemeInfo, VocabTermScheme
 from app.domain.extraction.evidence_context import validate_evidence_candidates
 from app.ollama.completion import CompletionResult
@@ -137,6 +138,9 @@ class FakeProfileService:
     def validate_document(self, *, identifier: str, document: dict):
         errors = [] if isinstance(document.get("id"), str) else [SimpleNamespace(path="$.id", message="required")]
         return SimpleNamespace(valid=not errors, errors=errors)
+
+    def export_document_formats(self, *, identifier: str, document: dict):
+        return ProfileDocumentExport()
 
 
 class TitleProfileService(FakeProfileService):
@@ -992,6 +996,83 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.generated_final_draft, {"id": "generated"})
         self.assertEqual(state.chunk_results[0].evidence_context.portable_evidence[0].candidate_id, "e-1")
+
+    async def test_profile_projection_keeps_export_warnings_in_saved_and_live_warnings(self):
+        # The task saves its local warning list right after persisting the
+        # exports; the SHACL summary must survive that save and reach the UI.
+        service, task_registry, output_repository = make_service([[make_chunk()]])
+
+        class NonConformingExportProfileService(FakeProfileService):
+            def export_document_formats(self, *, identifier: str, document: dict):
+                report = ShaclValidationReport(
+                    conforms=False,
+                    violation_count=2,
+                    profile_identifier=identifier,
+                    profile_version="9.9",
+                )
+                return ProfileDocumentExport(contents={"yaml": "id: generated\n"}, shacl_report=report)
+
+        service.profile_service = NonConformingExportProfileService()  # type: ignore[assignment]
+        persisted_context = RoutedEvidenceContext.model_validate(
+            evidence_context("e-1", "sample measured at 20 C")
+        )
+        output_repository.save_evidence_context(
+            workflow_id="package-id",
+            evidence_context=persisted_context,  # type: ignore[arg-type]  # fake repo is typed with EvidenceContext
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        output_repository.save_extraction_run_state(
+            workflow_id="package-id",
+            state=ExtractionRunState(
+                profile_identifier="profile",
+                chat_model="chat",
+                chunking_strategy="semantic",
+                ranked_files=[RankedFile(rank=1, file_path="README.md")],
+                chunk_results=[
+                    ExtractionChunkResult(
+                        chunk_index=0,
+                        file_path="README.md",
+                        start_idx=0,
+                        end_idx=1,
+                        status="completed",
+                        evidence_context=RoutedEvidenceContext(portable_evidence=persisted_context.portable_evidence),
+                    )
+                ],
+            ),
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+
+        async def fake_build(**kwargs):
+            kwargs["state"].generated_final_draft = {"id": "generated"}
+            kwargs["state"].generated_reconstructed_draft = {"id": "generated"}
+            kwargs["progress"].generated_final_draft = {"id": "generated"}
+            return {"id": "generated"}
+
+        service._build_profile_document_by_patching = fake_build  # type: ignore[method-assign]
+        await service.run_profile_projection(
+            data_package_id="package-id",
+            profile_identifier="profile",
+            resume=True,
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        await task_registry.wait_for_task("extraction:profile:package-id:semantic:chat", timeout=2)
+        _status, progress = await service.get_extraction_progress(
+            data_package_id="package-id",
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+
+        expected = (
+            "SHACL validation of draft document against profile 9.9: 2 violation(s); "
+            "see draft.shacl.json in the export folder of this branch."
+        )
+        self.assertIn(expected, output_repository.warnings)
+        self.assertIsNotNone(progress)
+        self.assertIn(expected, progress.warnings)  # type: ignore[union-attr]
+        self.assertEqual(output_repository.document_exports["draft"]["yaml"], "id: generated\n")
 
     async def test_profile_projection_requires_persisted_evidence_context(self):
         service, task_registry, output_repository = make_service([[make_chunk()]])

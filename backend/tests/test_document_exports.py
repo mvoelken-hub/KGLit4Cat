@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +14,13 @@ from rdflib.namespace import RDF
 
 from app.core.config import Settings
 from app.domain.extraction import ExtractionResultNotFoundError, ExtractionRunState
-from app.domain.profiles import DocumentExportError, export_profile_document, generate_profile_artifacts
+from app.domain.profiles import (
+    DocumentExportError,
+    _list_terms,
+    canonical_jsonld,
+    export_profile_document,
+    generate_profile_artifacts,
+)
 from app.services.profile_service import ProfileService
 from app.services.workflow_service import WorkflowService
 from infra.filesystem_extraction_output_repository import FileSystemExtractionOutputRepository
@@ -224,6 +233,87 @@ class SchemaAwareExportTests(unittest.TestCase):
         self.assertEqual({item.constraint for item in report.results}, {"ClassConstraintComponent"})
         self.assertEqual({item.result_path for item in report.results}, {"prov:wasGeneratedBy"})
 
+    def test_nodes_without_id_get_stable_positional_iris(self):
+        document = {"id": "pkg:dataset", "title": "Dataset", "was_generated_by": [{"title": "Generation"}]}
+
+        first = self._export(document)
+        second = self._export(document)
+
+        for export_format in ("jsonld", "ttl", "shacl"):
+            self.assertEqual(first.contents[export_format], second.contents[export_format], export_format)
+        graph = Graph().parse(data=first.contents["ttl"], format="turtle")
+        activity = URIRef("urn:simone:document/genid/pkg:dataset/was_generated_by/0")
+        self.assertIn((activity, RDF.type, PROV.Activity), graph)
+        self.assertNotIn("well-known/genid", first.contents["ttl"])
+
+    def test_exports_are_identical_across_processes(self):
+        # Graph iteration order depends on the hash seed, so compare two processes.
+        script = (
+            "import json, sys\n"
+            "sys.path[:0] = ['.', 'tests']\n"
+            "from rdflib import Graph\n"
+            "from app.domain.profiles import export_profile_document\n"
+            "from test_document_exports import NESTED_DOCUMENT, make_nested_artifacts\n"
+            "a = make_nested_artifacts()\n"
+            "e = export_profile_document(document=NESTED_DOCUMENT, jsonld_context=a.jsonld_context,"
+            " target_class='Dataset', json_schema=a.json_schema,"
+            " shacl_shapes=Graph().parse(data=a.shacl_shapes, format='turtle'))\n"
+            "print(json.dumps({k: e.contents[k] for k in ('jsonld', 'ttl', 'shacl')}))\n"
+        )
+        backend_dir = Path(__file__).resolve().parents[1]
+        outputs = [
+            subprocess.run(
+                [sys.executable, "-W", "ignore", "-c", script],
+                cwd=backend_dir,
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            for seed in ("1", "2")
+        ]
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_canonical_jsonld_sorts_sets_but_keeps_lists(self):
+        document = {
+            "@context": {"steps": {"@id": "ex:steps", "@container": "@list"}, "z": "ex:z"},
+            "@graph": [{"id": "b", "keyword": ["y", "x"]}, {"id": "a", "steps": ["2", "1"]}],
+        }
+
+        canonical = canonical_jsonld(document, _list_terms(document["@context"]))
+
+        self.assertEqual(canonical["@context"], document["@context"])
+        self.assertEqual([node["id"] for node in canonical["@graph"]], ["a", "b"])
+        self.assertEqual(canonical["@graph"][1]["keyword"], ["x", "y"])
+        self.assertEqual(canonical["@graph"][0]["steps"], ["2", "1"])
+
+    def test_document_without_root_id_gets_stable_root_iri(self):
+        export = self._export({"title": "Dataset"})
+
+        self.assertIn("<urn:simone:document/genid/document>", export.contents["ttl"])
+
+    def test_broken_shapes_only_cost_the_shacl_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = FileSystemProfileRepository(Path(directory))
+            repository.save_profile(self.artifacts)
+            (Path(directory) / "nested-profile" / "shacl_shapes.ttl").write_text("not turtle {", encoding="utf-8")
+
+            export = ProfileService(repository).export_document_formats(
+                identifier="nested-profile",
+                document=NESTED_DOCUMENT,
+            )
+
+        self.assertEqual(set(export.contents), {"json", "yaml", "jsonld", "ttl"})
+        self.assertTrue(export.errors["shacl"].startswith("SHACL shapes unavailable"))
+        self.assertIsNone(export.shacl_report)
+
+    def test_profile_registration_survives_shacl_generation_failure(self):
+        with patch("app.domain.profiles.generate_shacl_shapes", side_effect=RuntimeError("gen-shacl crashed")):
+            artifacts = make_nested_artifacts()
+
+        self.assertIsNone(artifacts.shacl_shapes)
+        self.assertIn("Dataset", artifacts.json_schema["$defs"])
+
     def test_profile_registration_stores_shapes_and_legacy_profiles_get_them_lazily(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = FileSystemProfileRepository(Path(directory))
@@ -345,6 +435,29 @@ class DocumentExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("as shacl failed" in warning for warning in warnings))
         # The JSON draft itself is still persisted.
         self.assertEqual(self.repo.load_generated_final_draft("pkg", chat_model="m"), DOCUMENT)
+
+    def test_export_failure_warnings_clear_after_successful_export(self):
+        self.repo.save_extraction_warnings(workflow_id="pkg", warnings=["existing warning"])
+        self.service.profile_service.load_shacl_shape_graph("test-profile")
+        with patch.object(Graph, "parse", side_effect=ValueError("broken JSON-LD")):
+            self.service._persist_state_artifacts("pkg", self._state())
+        self.assertGreater(len(self.repo.load_extraction_warnings("pkg")), 1)
+
+        self.service._persist_state_artifacts("pkg", self._state())
+
+        self.assertEqual(self.repo.load_extraction_warnings("pkg"), ["existing warning"])
+
+    def test_caller_warning_list_receives_export_warnings_instead_of_file(self):
+        untitled = {key: value for key, value in DOCUMENT.items() if key != "title"}
+        self.repo.save_extraction_warnings(workflow_id="pkg", warnings=["file warning"])
+        warnings = ["run warning"]
+
+        self.service._persist_state_artifacts("pkg", self._state(generated_reconstructed_draft=untitled), warnings=warnings)
+
+        self.assertEqual(warnings[0], "run warning")
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(warnings[1].startswith("SHACL validation of draft document"))
+        self.assertEqual(self.repo.load_extraction_warnings("pkg"), ["file warning"])
 
     def test_shacl_summary_warning_is_replaced_and_cleared(self):
         self.repo.save_extraction_warnings(workflow_id="pkg", warnings=["existing warning"])

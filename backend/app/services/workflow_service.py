@@ -1120,9 +1120,9 @@ class WorkflowService(
         progress.evidence_query_ledger = state.evidence_query_ledger
         progress.curation_ledger = state.curation_ledger
         progress.vocab_queries = state.vocab_queries
-        progress.warnings = list(warnings)
         self._save_run_state(data_package_id, state)
-        self._persist_state_artifacts(data_package_id, state)
+        self._persist_state_artifacts(data_package_id, state, warnings=warnings)
+        progress.warnings = list(warnings)
         self.output_repository.save_extraction_warnings(
             workflow_id=data_package_id,
             warnings=warnings,
@@ -1387,9 +1387,9 @@ class WorkflowService(
                 progress.field_completion_ledger = state.field_completion_ledger
                 progress.curation_ledger = state.curation_ledger
                 progress.vocab_queries = state.vocab_queries
-                progress.warnings = list(warnings)
                 self._save_run_state(data_package_id, state)
-                self._persist_state_artifacts(data_package_id, state)
+                self._persist_state_artifacts(data_package_id, state, warnings=warnings)
+                progress.warnings = list(warnings)
                 self.output_repository.save_extraction_warnings(
                     workflow_id=data_package_id,
                     warnings=warnings,
@@ -1752,9 +1752,9 @@ class WorkflowService(
             progress.field_completion_ledger = state.field_completion_ledger
             progress.curation_ledger = state.curation_ledger
             progress.vocab_queries = state.vocab_queries
-            progress.warnings = list(warnings)
             self._save_run_state(data_package_id, state)
-            self._persist_state_artifacts(data_package_id, state)
+            self._persist_state_artifacts(data_package_id, state, warnings=warnings)
+            progress.warnings = list(warnings)
             self.output_repository.save_extraction_warnings(
                 workflow_id=data_package_id,
                 warnings=warnings,

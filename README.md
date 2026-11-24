@@ -264,13 +264,13 @@ The RDF graph follows the profile's LinkML schema rather than only its JSON-LD c
 
 - Every nested object gets the `rdf:type` of its LinkML range class, taken from the profile's JSON Schema. For example, an object under `was_generated_by` with range `DataGeneratingActivity` becomes a `prov:Activity`. Without these types, SHACL shapes (selected via `sh:targetClass`) would never check nested nodes.
 - SIMONE ids such as `<package_id>:activity:<slug>` are not global IRIs. In RDF they are rebased onto `urn:simone:document/`, for example `urn:simone:document/fde6f638:activity:dataset-generation`. Ids that already use `http`, `https`, `urn`, `doi`, or a similar global scheme are kept. The JSON and YAML files keep the original ids.
-- Blank nodes are skolemized (`https://rdflib.github.io/.well-known/genid/...`). Otherwise rdflib's JSON-LD serializer drops nested objects that several terms map onto the same property.
+- Objects without an `id` get a stable IRI derived from their position in the document, for example `urn:simone:document/genid/fde6f638/was_generated_by/0/realized_plan` (`genid/document` for a root without `id`). Repeated exports of the same document therefore produce identical files. The IRIs also avoid blank nodes, which rdflib's JSON-LD serializer drops when several terms map onto the same property.
 
 #### SHACL report
 
 The workflow validates with the profile's JSON Schema (shown as "valid" in the UI). In addition, each export validates the exported RDF graph against SHACL shapes generated with LinkML `gen-shacl` from the registered profile. The shapes are stored as `profiles/<profile>/shacl_shapes.ttl`. Profiles registered earlier get them generated on first use. The report therefore always refers to the profile version the workflow actually uses. Its `profile_version` field names that version, for example `0.1.0rc4.post33.dev0+b75744da` for the current dca-ap-plus registration.
 
-The report does not block the workflow. If the graph does not conform, one summary warning per document is added to `extraction_warnings.json`. It replaces the previous summary for that document and is removed once the document conforms.
+The report does not block the workflow. If the graph does not conform, one summary warning per document is added to `extraction_warnings.json` and to the workflow progress (`warnings` in the progress API response). It replaces the previous summary for that document and is removed once the document conforms. Export failure warnings of a document are likewise replaced by the next export. If the shapes cannot be generated or loaded, only the SHACL report is missing (with a warning); YAML, JSON-LD, and Turtle are still written, and profile registration does not fail because of it.
 
 With dca-ap-plus, full conformance is currently not reachable even for documents that pass LinkML validation. The schema maps several slots (`realized_plan`, `evaluated_entity`, and others) onto `prov:used`, and `rdf_type` has the range `DefinedTerm`. `gen-shacl` turns both into constraints that a single value cannot satisfy at the same time. Treat such results as schema findings, not as extraction errors.
 

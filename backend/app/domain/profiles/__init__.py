@@ -230,11 +230,17 @@ def generate_profile_artifacts(
             jsonld_context = json.loads(
                 ContextGenerator(str(merged_schema_path)).serialize()
             )
-            shacl_shapes = generate_shacl_shapes(merged_schema_path)
         except Exception as exc:
             raise ProfileCompatibilityError(
                 f"Failed to generate profile artifacts for '{identifier}': {exc}"
             ) from exc
+        # SHACL shapes are optional: if gen-shacl cannot handle the schema the
+        # profile stays usable, the shapes are retried lazily on export and
+        # the failure is reported there.
+        try:
+            shacl_shapes: str | None = generate_shacl_shapes(merged_schema_path)
+        except Exception:
+            shacl_shapes = None
 
     detected_enrichable_fields = detect_enrichable_fields(
         induced_slot_names=[slot.name for slot in induced_slots],
@@ -390,6 +396,11 @@ def export_document_to_jsonld(
         )
 
     context_body = jsonld_context.get("@context", jsonld_context)
+    clean_document = assign_positional_ids(
+        document=clean_document,
+        id_keys=_id_keys(context_body),
+        base_iri=JSONLD_DOCUMENT_BASE_IRI,
+    )
     jsonld_document = {
         **clean_document,
         "@context": context_body,
@@ -404,9 +415,10 @@ def export_document_to_jsonld(
         format="json-ld",
         base=JSONLD_DOCUMENT_BASE_IRI,
     )
-    # rdflib's JSON-LD serializer drops blank-node objects reached through
-    # @id-coerced terms (e.g. several terms mapped to prov:used), losing their
-    # triples. Skolemized nodes are kept, so JSON-LD and Turtle stay identical.
+    # Positional ids leave (almost) no blank nodes. rdflib's JSON-LD
+    # serializer drops blank-node objects reached through @id-coerced terms
+    # (e.g. several terms mapped to prov:used), so any that remain (e.g. from
+    # @list containers) are skolemized to keep JSON-LD and Turtle identical.
     parsed = _rebase_local_iris(parsed, JSONLD_DOCUMENT_BASE_IRI)
     graph = parsed.skolemize(new_graph=Graph(namespace_manager=parsed.namespace_manager))
     serialized = graph.serialize(
@@ -415,12 +427,108 @@ def export_document_to_jsonld(
         auto_compact=True,
         indent=2,
     )
-    compact_document = json.loads(serialized)
+    # rdflib emits nodes and values in graph iteration order, which changes
+    # between processes; sort them so repeated exports are byte-identical.
+    compact_document = canonical_jsonld(json.loads(serialized), _list_terms(context_body))
     return JsonLdExportResult(
         document=compact_document,
         triple_count=len(graph),
         graph=graph,
     )
+
+
+def canonical_jsonld(value: Any, list_terms: frozenset[str] = frozenset(), key: str | None = None) -> Any:
+    """Deterministically order a JSON-LD document.
+
+    JSON-LD arrays are unordered sets, so they are sorted (including
+    ``@graph``); ordered lists (``@list`` and terms declared with
+    ``"@container": "@list"``) keep their order, and ``@context`` is untouched.
+    """
+
+    if isinstance(value, dict):
+        return {
+            item_key: item if item_key == "@context" else canonical_jsonld(item, list_terms, item_key)
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        items = [canonical_jsonld(item, list_terms) for item in value]
+        if key == "@list" or key in list_terms:
+            return items
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False))
+    return value
+
+
+def _list_terms(context_body: Any) -> frozenset[str]:
+    """Terms declared as ordered lists anywhere in the context (incl. scoped contexts)."""
+
+    terms: set[str] = set()
+
+    def visit(context: Any) -> None:
+        if not isinstance(context, dict):
+            return
+        for term, definition in context.items():
+            if not isinstance(definition, dict):
+                continue
+            container = definition.get("@container")
+            if container == "@list" or (isinstance(container, list) and "@list" in container):
+                terms.add(term)
+            visit(definition.get("@context"))
+
+    visit(context_body)
+    return frozenset(terms)
+
+
+def assign_positional_ids(
+    *,
+    document: dict[str, Any],
+    id_keys: frozenset[str],
+    base_iri: str,
+) -> dict[str, Any]:
+    """Return a copy of ``document`` where every object without an id gets one.
+
+    The id is derived from the object's position, e.g.
+    ``urn:simone:document/genid/<root-id>/was_generated_by/0/realized_plan``,
+    so repeated exports of the same document yield identical RDF instead of
+    random blank-node or skolem IRIs.
+    """
+
+    copy = deepcopy(document)
+    root_id = next(
+        (copy[key] for key in id_keys if isinstance(copy.get(key), str) and copy[key]),
+        None,
+    )
+    prefix = f"{base_iri}genid/{quote(root_id, safe=':-._~') if root_id else 'document'}"
+
+    def visit(value: Any, pointer: str) -> None:
+        if isinstance(value, dict):
+            if "@value" in value:
+                return
+            if not any(key in value for key in id_keys):
+                value["@id"] = prefix + pointer
+            for key, item in value.items():
+                if not key.startswith("@"):
+                    visit(item, f"{pointer}/{_json_pointer_segment(key)}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{pointer}/{index}")
+
+    visit(copy, "")
+    return copy
+
+
+def _id_keys(context_body: Any) -> frozenset[str]:
+    """Keys that hold a node id: ``@id`` plus every term aliased to it (LinkML: ``id``)."""
+
+    aliases = (
+        {term for term, definition in context_body.items() if definition == "@id"}
+        if isinstance(context_body, dict)
+        else set()
+    )
+    return frozenset({"@id", *aliases})
+
+
+def _json_pointer_segment(key: str) -> str:
+    return quote(key.replace("~", "~0").replace("/", "~1"), safe="-._~")
 
 
 def annotate_document_types(
