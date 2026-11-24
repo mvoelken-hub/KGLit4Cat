@@ -18,6 +18,7 @@ from app.ollama.completion import (
     _strip_markdown_fences,
     generate_structured,
     generate_text,
+    parse_think_mode,
     repair_structured_output,
 )
 from app.ollama.errors import CompletionError, EmptyResponseError, MaxRetriesExceeded, OutputParsingError
@@ -365,6 +366,111 @@ class GenerateStructuredHappyPathTests(IsolatedAsyncioTestCase):
         )
         self.assertTrue(call["think"])
         self.assertEqual(call["keep_alive"], 300)
+
+    async def test_client_think_mode_off_sends_think_false(self):
+        client = FakeOllamaClient([
+            FakeGenerateResponse(response='{"answer": "x", "score": 1}'),
+        ])
+        client.chat_think_mode = "off"
+
+        result = await generate_structured(
+            client,
+            model="gemma4:26b",
+            system="sys",
+            prompt="prompt",
+            output_type=SimpleOutput,
+        )
+
+        self.assertIs(client.calls[0]["think"], False)
+        self.assertEqual(result.prompt_diagnostics.attempts[0].think, "off")
+
+    async def test_client_think_mode_auto_sends_no_think_parameter(self):
+        client = FakeOllamaClient([
+            FakeGenerateResponse(response='{"answer": "x", "score": 1}'),
+        ])
+        client.chat_think_mode = "auto"
+
+        result = await generate_structured(
+            client,
+            model="gemma4:31b-cloud",
+            system="sys",
+            prompt="prompt",
+            output_type=SimpleOutput,
+        )
+
+        self.assertNotIn("think", client.calls[0])
+        self.assertEqual(result.prompt_diagnostics.attempts[0].think, "auto")
+
+    async def test_client_without_think_mode_keeps_previous_behavior(self):
+        client = FakeOllamaClient([
+            FakeGenerateResponse(response='{"answer": "x", "score": 1}'),
+        ])
+
+        await generate_structured(
+            client,
+            model="m",
+            system="sys",
+            prompt="prompt",
+            output_type=SimpleOutput,
+        )
+
+        self.assertNotIn("think", client.calls[0])
+
+    async def test_explicit_call_think_overrides_client_think_mode(self):
+        client = FakeOllamaClient([
+            FakeGenerateResponse(response='{"answer": "x", "score": 1}'),
+        ])
+        client.chat_think_mode = "off"
+
+        await generate_structured(
+            client,
+            model="m",
+            system="sys",
+            prompt="prompt",
+            output_type=SimpleOutput,
+            think="high",
+        )
+
+        self.assertEqual(client.calls[0]["think"], "high")
+
+    async def test_repair_attempts_use_client_think_mode(self):
+        client = FakeOllamaClient([
+            FakeGenerateResponse(response="bad json"),
+            FakeGenerateResponse(response='{"answer": "x", "score": 1}'),
+        ])
+        client.chat_think_mode = "off"
+
+        result = await generate_structured(
+            client,
+            model="m",
+            system="sys",
+            prompt="prompt",
+            output_type=SimpleOutput,
+            retries=1,
+        )
+
+        self.assertEqual([call["think"] for call in client.calls], [False, False])
+        self.assertEqual(
+            [attempt.think for attempt in result.prompt_diagnostics.attempts],
+            ["off", "off"],
+        )
+
+    async def test_generate_text_uses_client_think_mode(self):
+        client = FakeOllamaClient([FakeGenerateResponse(response="plain")])
+        client.chat_think_mode = "on"
+
+        await generate_text(client, model="m", system="sys", prompt="prompt")
+
+        self.assertIs(client.calls[0]["think"], True)
+
+    def test_parse_think_mode_maps_and_validates_values(self):
+        self.assertIsNone(parse_think_mode("auto"))
+        self.assertIsNone(parse_think_mode(""))
+        self.assertIs(parse_think_mode("On"), True)
+        self.assertIs(parse_think_mode(" off "), False)
+        self.assertEqual(parse_think_mode("medium"), "medium")
+        with self.assertRaises(ValueError):
+            parse_think_mode("sometimes")
 
     async def test_wrapper_temperature_overrides_call_temperature(self):
         client = FakeOllamaClient([

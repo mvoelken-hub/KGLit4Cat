@@ -2203,6 +2203,7 @@ def _models_action_config(model_settings, env_values: dict[str, str], loop) -> N
         max_ctx = runtime.get("max_context_length", model_settings.max_context_length)
         embed_batch = runtime.get("embedding_batch_size", model_settings.embedding_batch_size)
         embed_num_gpu = runtime.get("embedding_num_gpu", model_settings.ollama_embed_num_gpu)
+        chat_think = runtime.get("chat_think", model_settings.ollama_chat_think)
         input_budget = runtime.get("input_token_budget", int(max_ctx * 0.75))
         host_info = api_config.get("host", {})
         is_local = host_info.get("is_local", False)
@@ -2214,6 +2215,7 @@ def _models_action_config(model_settings, env_values: dict[str, str], loop) -> N
         max_ctx = model_settings.max_context_length
         embed_batch = model_settings.embedding_batch_size
         embed_num_gpu = model_settings.ollama_embed_num_gpu
+        chat_think = model_settings.ollama_chat_think
         input_budget = int(max_ctx * 0.75)
         is_local = _is_local_host(env_values.get("OLLAMA_HOSTNAME"))
         flash_attn = model_settings.ollama_flash_attention
@@ -2228,6 +2230,7 @@ def _models_action_config(model_settings, env_values: dict[str, str], loop) -> N
     typer.echo(f"  Input token budget:    {input_budget} (75% of context)")
     typer.echo(f"  Embedding batch size:  {embed_batch}")
     typer.echo(f"  Embedding GPU:         {embed_num_gpu} ({embed_gpu_label})")
+    typer.echo(f"  Chat thinking:         {chat_think}  (auto = model default)")
     if is_local:
         typer.echo(f"  Flash attention:       {flash_attn}  (server-side)")
         typer.echo(f"  KV cache type:         {kv_cache}  (server-side)")
@@ -2244,6 +2247,7 @@ def _models_action_config(model_settings, env_values: dict[str, str], loop) -> N
     typer.echo("  [3] Max context length")
     typer.echo("  [4] Embedding batch size")
     typer.echo("  [5] Embedding GPU layers")
+    typer.echo("  [6] Chat thinking mode")
     typer.echo("  [a] Apply all changes to running API (hot-reload)")
     typer.echo("  [q] Back to model list")
 
@@ -2295,6 +2299,26 @@ def _models_action_config(model_settings, env_values: dict[str, str], loop) -> N
             env_values["OLLAMA_EMBED_NUM_GPU"] = str(new_val)
             os.environ["OLLAMA_EMBED_NUM_GPU"] = str(new_val)
             typer.echo(f"  Written OLLAMA_EMBED_NUM_GPU={new_val} to .env")
+    elif choice == "6":
+        import click
+
+        from app.ollama.completion import THINK_MODE_CHOICES
+
+        typer.echo(
+            "  Chat thinking: auto = model default (no parameter sent), on/off, or low/medium/high. "
+            "Use off if a model loops in structured output."
+        )
+        new_val = typer.prompt(
+            "Chat thinking mode",
+            type=click.Choice(THINK_MODE_CHOICES, case_sensitive=False),
+            default=str(chat_think),
+        ).strip().lower()
+        if new_val != chat_think:
+            patch["chat_think"] = new_val
+            _write_env_value(ENV_FILE, "OLLAMA_CHAT_THINK", new_val)
+            env_values["OLLAMA_CHAT_THINK"] = new_val
+            os.environ["OLLAMA_CHAT_THINK"] = new_val
+            typer.echo(f"  Written OLLAMA_CHAT_THINK={new_val} to .env")
     elif choice == "a":
         # Apply all pending .env changes to the running API
         if not api_reachable:
@@ -2306,6 +2330,7 @@ def _models_action_config(model_settings, env_values: dict[str, str], loop) -> N
         patch["max_context_length"] = int(env_values.get("MAX_CONTEXT_LENGTH", str(max_ctx)))
         patch["embedding_batch_size"] = int(env_values.get("EMBEDDING_BATCH_SIZE", str(embed_batch)))
         patch["embedding_num_gpu"] = int(env_values.get("OLLAMA_EMBED_NUM_GPU", str(embed_num_gpu)))
+        patch["chat_think"] = env_values.get("OLLAMA_CHAT_THINK", str(chat_think)).strip().lower() or "auto"
     else:
         typer.echo(f"Unknown choice: {choice}")
         return
