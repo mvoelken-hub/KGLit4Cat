@@ -13,7 +13,13 @@ from app.domain.datasources import (
     DataPackageZipNotFoundError,
     MultipleDataPackageZipFilesError,
 )
-from app.domain.datasources.file_types import FileType, determine_file_type, extract_text_from_file
+from app.domain.datasources.file_types import (
+    FileType,
+    determine_file_type,
+    extract_text_from_file,
+    extract_text_from_pdf,
+)
+from app.domain.datasources.text_quality import DecisionKind, classify_text_line
 from infra.filesystem_datasource_blob_repository import FileSystemDataSourceBlobRepository
 
 
@@ -30,6 +36,54 @@ def pdf_bytes(text: str) -> bytes:
     doc = pymupdf.open()
     page = doc.new_page()
     page.insert_text((72, 72), text)
+    return doc.tobytes()
+
+
+def _insert_pdf_lines(page, x: float, y: float, lines: list[str], fontsize: float = 10, leading: float = 12) -> float:
+    for line in lines:
+        page.insert_text((x, y), line, fontsize=fontsize)
+        y += leading
+    return y
+
+
+def publication_pdf_bytes() -> bytes:
+    """Three-page, two-column publication with narrow justified-style lines,
+    line-end hyphenation, and running headers/footers."""
+    doc = pymupdf.open()
+    left_x, right_x = 50, 310
+    for page_index in range(3):
+        page = doc.new_page(width=595, height=842)
+        if page_index == 0:
+            y = _insert_pdf_lines(page, left_x, 100, [
+                "This review discusses",
+                "CO2",
+                "and CO methanation over",
+                "Ni-Al2O3 catalysts with suc-",
+                "cessful results.",
+            ])
+            _insert_pdf_lines(page, left_x, y + 30, [
+                "The second paragraph starts in the",
+                "first column and continues in",
+            ])
+            _insert_pdf_lines(page, right_x, 100, [
+                "the second column without a",
+                "break in the sentence.",
+            ])
+        elif page_index == 1:
+            _insert_pdf_lines(page, left_x, 100, [
+                "Grid-scale storage needs long-term",
+                "planning. Power-to-gas plants need",
+                "long-",
+                "term contracts for stable operation.",
+            ])
+        else:
+            _insert_pdf_lines(page, left_x, 100, [
+                "The final page summarizes the",
+                "main findings of this review.",
+            ])
+        page.insert_text((left_x, 40), "Journal of Testing Reviews", fontsize=8)
+        page.insert_text((left_x, 810), f"Test J., 2016, 6, 10-20 | {10 + page_index}", fontsize=8)
+        page.insert_text((left_x, 822), "This journal is (c) The Test Society 2016", fontsize=8)
     return doc.tobytes()
 
 
@@ -223,6 +277,94 @@ class DataPackageTests(unittest.TestCase):
 
         self.assertEqual(file_entry.file_extension, ".pdf")
         self.assertIn("Nested catalyst content", file_entry.get_extracted_content())
+
+    def test_pdf_extraction_joins_narrow_lines_into_whole_dehyphenated_sentences(self):
+        extracted = extract_text_from_pdf(publication_pdf_bytes())
+        lines = extracted.splitlines()
+
+        self.assertIn(
+            "This review discusses CO2 and CO methanation over Ni-Al2O3 catalysts with successful results.",
+            lines,
+        )
+        self.assertNotIn("suc-", extracted)
+        self.assertEqual([line for line in lines if len(line.split()) <= 1], [])
+
+    def test_pdf_extraction_rejoins_paragraph_across_columns_in_reading_order(self):
+        extracted = extract_text_from_pdf(publication_pdf_bytes())
+        lines = extracted.splitlines()
+
+        self.assertIn(
+            "The second paragraph starts in the first column and continues in "
+            "the second column without a break in the sentence.",
+            lines,
+        )
+        self.assertLess(
+            extracted.index("This review discusses"),
+            extracted.index("The second paragraph"),
+        )
+        self.assertLess(
+            extracted.index("The second paragraph"),
+            extracted.index("The final page"),
+        )
+
+    def test_pdf_extraction_keeps_compound_hyphen_seen_elsewhere_in_document(self):
+        extracted = extract_text_from_pdf(publication_pdf_bytes())
+
+        self.assertIn("Power-to-gas plants need long-term contracts", extracted)
+        self.assertNotIn("longterm", extracted)
+
+    def test_pdf_extraction_removes_running_headers_and_footers(self):
+        extracted = extract_text_from_pdf(publication_pdf_bytes())
+
+        self.assertNotIn("Journal of Testing Reviews", extracted)
+        self.assertNotIn("Test J., 2016", extracted)
+        self.assertNotIn("This journal is", extracted)
+        self.assertIn("The final page summarizes the main findings of this review.", extracted)
+
+    def test_pdf_extraction_lines_pass_text_quality_gate(self):
+        extracted = extract_text_from_pdf(publication_pdf_bytes())
+
+        dropped = [
+            line
+            for line in extracted.splitlines()
+            if classify_text_line(line).kind != DecisionKind.KEEP
+        ]
+        self.assertEqual(dropped, [])
+
+    def test_pdf_extraction_packs_long_justified_paragraph_at_sentence_ends(self):
+        sentences = [
+            f"Sentence number {index} describes one observation about the catalyst surface in detail."
+            for index in range(1, 13)
+        ]
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_textbox(
+            pymupdf.Rect(50, 80, 300, 800),
+            " ".join(sentences),
+            fontsize=10,
+            align=pymupdf.TEXT_ALIGN_JUSTIFY,
+        )
+
+        lines = extract_text_from_pdf(doc.tobytes()).splitlines()
+
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line) <= 400 for line in lines))
+        self.assertTrue(all(line.endswith(".") for line in lines))
+        self.assertEqual(" ".join(lines), " ".join(sentences))
+
+    def test_pdf_extraction_keeps_short_blocks_repeated_on_few_pages(self):
+        topics = ["kinetics", "adsorption", "selectivity", "deactivation", "outlook"]
+        doc = pymupdf.open()
+        for page_index, topic in enumerate(topics):
+            page = doc.new_page(width=595, height=842)
+            page.insert_text((50, 100), f"This page discusses {topic} in detail.")
+            if page_index < 2:
+                page.insert_text((50, 300), "See the appendix for details.")
+
+        extracted = extract_text_from_pdf(doc.tobytes())
+
+        self.assertEqual(extracted.count("See the appendix for details."), 2)
+        self.assertEqual(extracted.count("This page discusses"), 5)
 
     def test_extract_text_from_file_dispatches_csv_without_dot_suffix(self):
         extracted = extract_text_from_file(

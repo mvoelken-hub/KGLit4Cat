@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -40,6 +40,7 @@ class OllamaRuntimeConfigPatch(BaseModel):
     generation_temperature: float | None = Field(None, ge=0.0, le=2.0)
     generation_seed: int | None = Field(None, ge=0)
     enforce_output_token_limit: bool | None = None
+    chat_think: Literal["auto", "on", "off", "low", "medium", "high"] | None = None
 
 
 class OllamaModelRequest(BaseModel):

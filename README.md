@@ -71,6 +71,7 @@ Advanced variables usually do not need editing:
 | `OLLAMA_FLASH_ATTENTION` | `1` | Local Ollama container Flash Attention setting. |
 | `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Local Ollama container KV cache type. |
 | `OLLAMA_EMBED_NUM_GPU` | `-1` | Embedding request GPU override: `-1` auto, `0` CPU, positive values set GPU layers. |
+| `OLLAMA_CHAT_THINK` | `auto` | Chat thinking mode: `auto` (model default, no parameter sent), `on`, `off`, `low`, `medium`, `high`. Set `off` if a model loops in structured output (seen with local `gemma4:26b`). Also changeable at runtime in the Ollama settings panel or via `simone models`. |
 | `API_PROXY_TARGET` | `http://api:8000` | Backend target used by the Docker frontend nginx proxy. |
 | `VITE_API_BASE_URL` | `/api/v1` | Frontend API base path baked into the frontend build. |
 | `VITE_PROXY_TARGET` | `http://127.0.0.1:8000` | Vite dev-server API proxy target. |
@@ -246,6 +247,8 @@ simone signin-ollama
 ```
 
 If Ollama prints a connect link, open it in your browser and complete the sign-in. The credential is stored in `data/docker/ollama/data`, so you normally only need this once per local data volume.
+
+If the health check reports `status code: 402` ("Add usage credits or subscribe"), the sign-in worked but the Ollama Cloud quota is exhausted. Add credits, or switch to a local chat model: pull it (for example `docker exec kglit4cat-dataset-ollama-1 ollama pull gemma4:26b`), then set `OLLAMA_CHAT_MODEL` in `.env` or use `simone models` → chat model → apply. Extraction stages check the chat model before they start and report these errors directly. If the local model produces repetitive or truncated structured output, set `OLLAMA_CHAT_THINK=off`.
 
 ### Neo4j Data Maintenance
 

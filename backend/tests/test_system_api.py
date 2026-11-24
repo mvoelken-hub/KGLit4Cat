@@ -54,6 +54,7 @@ class FakeOllamaClient:
     generation_temperature = 0.0
     generation_seed = 42
     enforce_output_token_limit = True
+    chat_think_mode = "auto"
 
     def __init__(self):
         self.updates = []
@@ -113,6 +114,8 @@ class FakeOllamaClient:
             self.generation_seed = kwargs["generation_seed"]
         if kwargs.get("enforce_output_token_limit") is not None:
             self.enforce_output_token_limit = kwargs["enforce_output_token_limit"]
+        if kwargs.get("chat_think_mode") is not None:
+            self.chat_think_mode = kwargs["chat_think_mode"]
 
 
 class TestSystemApi:
@@ -154,6 +157,7 @@ class TestSystemApi:
         assert payload["runtime"]["generation_temperature"] == 0.0
         assert payload["runtime"]["generation_seed"] == 42
         assert payload["runtime"]["enforce_output_token_limit"] is True
+        assert payload["runtime"]["chat_think"] == "auto"
         assert payload["running"]["chat_model_loaded"] is True
         assert payload["running"]["embedding_model_loaded"] is True
         assert payload["running"]["both_configured_models_loaded"] is True
@@ -241,11 +245,13 @@ class TestSystemApi:
                 "generation_temperature": 0.2,
                 "generation_seed": 123,
                 "enforce_output_token_limit": False,
+                "chat_think": "off",
             },
         )
 
         assert response.status_code == 200
         payload = response.json()
+        assert payload["runtime"]["chat_think"] == "off"
         assert payload["runtime"]["chat_model"] == "next-chat"
         assert payload["runtime"]["embedding_model"] == "next-embed"
         assert payload["runtime"]["max_context_length"] == 16384
@@ -262,6 +268,7 @@ class TestSystemApi:
             "generation_temperature": 0.2,
             "generation_seed": 123,
             "enforce_output_token_limit": False,
+            "chat_think_mode": "off",
         }
 
     def test_ollama_runtime_patch_validates_bounds(self):
@@ -270,6 +277,20 @@ class TestSystemApi:
         response = client.patch("/api/v1/ollama-config/runtime", json={"max_context_length": 128})
 
         assert response.status_code == 422
+
+    def test_ollama_runtime_patch_rejects_unknown_think_mode(self):
+        client = self.make_client()
+
+        response = client.patch("/api/v1/ollama-config/runtime", json={"chat_think": "sometimes"})
+
+        assert response.status_code == 422
+
+    def test_chat_think_setting_loads_from_env(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_CHAT_THINK", "off")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.ollama_chat_think == "off"
 
     def test_generation_runtime_settings_load_from_env(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_GENERATION_TEMPERATURE", "0.25")

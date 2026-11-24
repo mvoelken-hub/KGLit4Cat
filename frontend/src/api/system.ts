@@ -67,6 +67,7 @@ export type OllamaConfig = {
     embedding_gpu_label: string;
     generation_temperature: number;
     enforce_output_token_limit: boolean;
+    chat_think?: ChatThinkMode;
     resets_on_api_restart: boolean;
   };
   models: {
@@ -86,6 +87,8 @@ export type OllamaConfig = {
   warnings: string[];
 };
 
+export type ChatThinkMode = 'auto' | 'on' | 'off' | 'low' | 'medium' | 'high';
+
 export type OllamaRuntimePatch = {
   chat_model?: string;
   embedding_model?: string;
@@ -94,6 +97,7 @@ export type OllamaRuntimePatch = {
   embedding_num_gpu?: number;
   generation_temperature?: number;
   enforce_output_token_limit?: boolean;
+  chat_think?: ChatThinkMode;
 };
 
 export type OllamaPerformanceTest = {

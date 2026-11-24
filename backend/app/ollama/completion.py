@@ -45,7 +45,45 @@ if TYPE_CHECKING:
 
 JsonSchema: TypeAlias = dict[str, Any]
 ThinkMode: TypeAlias = bool | Literal["low", "medium", "high"] | None
+THINK_MODE_CHOICES: tuple[str, ...] = ("auto", "on", "off", "low", "medium", "high")
 T = TypeVar("T")
+
+
+def parse_think_mode(value: str | None) -> ThinkMode:
+    """Map a configured thinking mode to the Ollama ``think`` request value.
+
+    ``auto`` (or empty) sends no ``think`` parameter, leaving the model default.
+    """
+    normalized = (value or "auto").strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized == "on":
+        return True
+    if normalized == "off":
+        return False
+    if normalized in ("low", "medium", "high"):
+        return cast(ThinkMode, normalized)
+    raise ValueError(
+        f"Invalid chat thinking mode {value!r}; expected one of: {', '.join(THINK_MODE_CHOICES)}"
+    )
+
+
+def think_mode_label(think: ThinkMode) -> str:
+    """Inverse of :func:`parse_think_mode`, used for diagnostics."""
+    if think is None:
+        return "auto"
+    if think is True:
+        return "on"
+    if think is False:
+        return "off"
+    return str(think)
+
+
+def _effective_think(client: Any, think: ThinkMode) -> ThinkMode:
+    """An explicit per-call value wins; otherwise use the client's configured mode."""
+    if think is not None:
+        return think
+    return parse_think_mode(getattr(client, "chat_think_mode", "auto"))
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _MARKDOWN_FENCE_RE = re.compile(
@@ -116,7 +154,7 @@ async def generate_text(
         system=system,
         prompt=prompt,
         options=request_options,
-        think=think,
+        think=_effective_think(ollama_client, think),
         keep_alive=keep_alive,
     )
     return CompletionResult(
@@ -781,6 +819,7 @@ async def generate_structured(
     """
     schema = _pruned_json_schema(_extract_json_schema(output_type), omitted_fields)
     raw_schema_validator = _json_schema_validator(schema) if isinstance(output_type, dict) else None
+    think = _effective_think(client, think)
 
     base_system_components = _normalize_prompt_components(
         system_components,
@@ -830,6 +869,7 @@ async def generate_structured(
             prompt_components=current_prompt_components,
             token_budgeter=token_budgeter,
         )
+        attempt_diagnostic.think = think_mode_label(think)
         diagnostics.attempts.append(attempt_diagnostic)
         options = _structured_generation_options(
             client,
