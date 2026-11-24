@@ -53,6 +53,7 @@ DOCUMENT_EXPORT_MEDIA_TYPES: dict[str, tuple[str, str]] = {
     "yaml": ("application/yaml", ".yaml"),
     "jsonld": ("application/ld+json", ".jsonld"),
     "ttl": ("text/turtle", ".ttl"),
+    "shacl": ("application/json", ".shacl.json"),
 }
 
 

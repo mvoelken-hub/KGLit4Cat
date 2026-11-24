@@ -623,7 +623,7 @@ export async function getExtractionResult(data_package_id: string, chunking_stra
   return readJson(await response);
 }
 
-export type DocumentExportFormat = 'json' | 'yaml' | 'jsonld' | 'ttl';
+export type DocumentExportFormat = 'json' | 'yaml' | 'jsonld' | 'ttl' | 'shacl';
 
 /** Downloads the curated document (or, if none was saved, the generated draft) in the given format. */
 export async function downloadExtractionDocument(

@@ -6423,14 +6423,14 @@ class ProjectionService:
             chat_model=state.chat_model,
         )
         # Exports mirror the documents save_extraction_result writes below.
-        export_warnings = self._persist_document_exports(
+        export_warnings, superseded = self._persist_document_exports(
             data_package_id,
             state,
             draft=clean_document,
             curated=state.curated_document,
             persist_warnings=False,
         )
-        warnings = warnings + [warning for warning in export_warnings if warning not in warnings]
+        warnings = self._merge_export_warnings(warnings, export_warnings, superseded)
         result = ExtractionRunResult(
             generated_final_draft=clean_document,
             machine_evidence_context=evidence_context,
@@ -6929,18 +6929,23 @@ class ProjectionService:
         draft: dict[str, Any] | None,
         curated: dict[str, Any] | None,
         persist_warnings: bool = True,
-    ) -> list[str]:
-        """Write YAML/JSON-LD/Turtle exports next to the persisted JSON documents.
+    ) -> tuple[list[str], tuple[str, ...]]:
+        """Write YAML/JSON-LD/Turtle exports and the SHACL report next to the JSON documents.
 
         Export failures never interrupt the workflow: they are logged and
-        returned (and, by default, appended to ``extraction_warnings.json``).
+        returned as warnings. Returns the new warnings and the warning prefixes
+        they supersede (the previous SHACL summary of each exported document);
+        by default both are merged into ``extraction_warnings.json``.
         """
         if self.output_repository is None or not state.profile_identifier:
-            return []
+            return [], ()
         warnings: list[str] = []
+        superseded: list[str] = []
         for document_name, document in (("draft", draft), ("curated", curated)):
             if document is None:
                 continue
+            shacl_prefix = f"SHACL validation of {document_name} document"
+            superseded.append(shacl_prefix)
             try:
                 export = self.profile_service.export_document_formats(
                     identifier=state.profile_identifier,
@@ -6954,13 +6959,20 @@ class ProjectionService:
                     warnings.append(
                         f"Export of {document_name} document as {export_format} failed: {message}"
                     )
+            report = export.shacl_report
+            if report is not None and not report.conforms:
+                warnings.append(
+                    f"{shacl_prefix} against {report.profile_identifier} {report.profile_version}: "
+                    f"{report.violation_count} violation(s); see {document_name}.shacl.json "
+                    "in the export folder of this branch."
+                )
             try:
                 self.output_repository.save_document_exports(
                     workflow_id=data_package_id,
                     document_name=document_name,
                     exports={
                         export_format: export.contents.get(export_format)
-                        for export_format in ("yaml", "jsonld", "ttl")
+                        for export_format in ("yaml", "jsonld", "ttl", "shacl")
                     },
                     chat_model=state.chat_model,
                     chunking_strategy=state.chunking_strategy,
@@ -6969,15 +6981,28 @@ class ProjectionService:
                 warnings.append(f"Writing {document_name} document exports failed: {exc}")
         for warning in warnings:
             logger.warning("%s (workflow '%s')", warning, data_package_id)
-        if warnings and persist_warnings:
+        if persist_warnings:
             existing = self._load_warnings_or_empty(data_package_id)
-            merged = existing + [warning for warning in warnings if warning not in existing]
+            merged = self._merge_export_warnings(existing, warnings, tuple(superseded))
             if merged != existing:
                 self.output_repository.save_extraction_warnings(
                     workflow_id=data_package_id,
                     warnings=merged,
                 )
-        return warnings
+        return warnings, tuple(superseded)
+
+    @staticmethod
+    def _merge_export_warnings(
+        existing: list[str],
+        new: list[str],
+        superseded_prefixes: tuple[str, ...],
+    ) -> list[str]:
+        kept = [
+            warning
+            for warning in existing
+            if not warning.startswith(superseded_prefixes) or warning in new
+        ]
+        return kept + [warning for warning in new if warning not in kept]
 
     def _clear_downstream_extraction_outputs(self, data_package_id: str) -> None:
         if self.output_repository is None:

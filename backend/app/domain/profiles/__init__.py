@@ -7,19 +7,27 @@ from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
+from urllib.parse import quote
 
 import yaml
 from jsonschema import Draft201909Validator
 from linkml.generators.jsonldcontextgen import ContextGenerator
 from linkml.generators.jsonschemagen import JsonSchemaGenerator
+from linkml.generators.shaclgen import ShaclGenerator
 from linkml_runtime.dumpers import yaml_dumper
 from linkml_runtime.utils.schemaview import SchemaView
 from pydantic import BaseModel, ConfigDict, Field
-from rdflib import Graph
+from pyshacl import validate as shacl_validate
+from rdflib import Graph, Namespace, URIRef
+from rdflib.namespace import RDF
 
 
 PROFILE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 JSONLD_DOCUMENT_BASE_IRI = "urn:simone:document/"
+# URI schemes accepted as-is in exported RDF. Local SIMONE ids such as
+# "<package>:activity:<slug>" would otherwise be read as an IRI with the
+# package id as scheme; those are rebased onto JSONLD_DOCUMENT_BASE_IRI.
+GLOBAL_IRI_SCHEMES = frozenset({"http", "https", "urn", "mailto", "doi", "info", "tag", "ftp", "did"})
 DEFAULT_ENRICHABLE_FIELD_CANDIDATES = frozenset(
     {"type", "has_quantity_type", "unit"}
 )
@@ -74,6 +82,7 @@ class GeneratedProfileArtifacts(BaseModel):
     merged_schema: str
     json_schema: dict[str, Any]
     jsonld_context: dict[str, Any]
+    shacl_shapes: str | None = None
 
 
 class ProfileValidationIssue(BaseModel):
@@ -97,8 +106,29 @@ class JsonLdExportResult(BaseModel):
     graph: Graph | None = Field(default=None, exclude=True)
 
 
-DocumentExportFormat = Literal["json", "yaml", "jsonld", "ttl"]
-DOCUMENT_EXPORT_FORMATS: tuple[DocumentExportFormat, ...] = ("json", "yaml", "jsonld", "ttl")
+DocumentExportFormat = Literal["json", "yaml", "jsonld", "ttl", "shacl"]
+DOCUMENT_EXPORT_FORMATS: tuple[DocumentExportFormat, ...] = ("json", "yaml", "jsonld", "ttl", "shacl")
+
+SH = Namespace("http://www.w3.org/ns/shacl#")
+
+
+class ShaclValidationResultItem(BaseModel):
+    focus_node: str
+    result_path: str | None = None
+    value: str | None = None
+    message: str | None = None
+    severity: str
+    constraint: str | None = None
+
+
+class ShaclValidationReport(BaseModel):
+    """SHACL validation of an exported document graph against profile shapes."""
+
+    conforms: bool
+    violation_count: int
+    profile_identifier: str | None = None
+    profile_version: str | None = None
+    results: list[ShaclValidationResultItem] = Field(default_factory=list)
 
 
 class ProfileDocumentExport(BaseModel):
@@ -111,6 +141,7 @@ class ProfileDocumentExport(BaseModel):
     contents: dict[DocumentExportFormat, str] = Field(default_factory=dict)
     errors: dict[DocumentExportFormat, str] = Field(default_factory=dict)
     triple_count: int | None = None
+    shacl_report: ShaclValidationReport | None = None
 
 
 def validate_profile_identifier(identifier: str) -> str:
@@ -199,6 +230,7 @@ def generate_profile_artifacts(
             jsonld_context = json.loads(
                 ContextGenerator(str(merged_schema_path)).serialize()
             )
+            shacl_shapes = generate_shacl_shapes(merged_schema_path)
         except Exception as exc:
             raise ProfileCompatibilityError(
                 f"Failed to generate profile artifacts for '{identifier}': {exc}"
@@ -229,6 +261,57 @@ def generate_profile_artifacts(
         merged_schema=merged_schema,
         json_schema=json_schema,
         jsonld_context=jsonld_context,
+        shacl_shapes=shacl_shapes,
+    )
+
+
+def generate_shacl_shapes(merged_schema_path: Path | str) -> str:
+    """Generate SHACL shapes (Turtle) for a merged LinkML schema via gen-shacl."""
+
+    return ShaclGenerator(str(merged_schema_path)).serialize()
+
+
+def validate_graph_against_shacl(
+    *,
+    graph: Graph,
+    shapes: Graph,
+    profile_identifier: str | None = None,
+    profile_version: str | None = None,
+) -> ShaclValidationReport:
+    conforms, results_graph, _ = shacl_validate(
+        graph,
+        shacl_graph=shapes,
+        inference="none",
+        allow_warnings=True,
+    )
+    assert isinstance(results_graph, Graph)
+
+    def text(node: Any) -> str | None:
+        if node is None:
+            return None
+        if not isinstance(node, URIRef):
+            return str(node)
+        name = graph.namespace_manager.normalizeUri(node)
+        return name[1:-1] if name.startswith("<") and name.endswith(">") else name
+
+    results = [
+        ShaclValidationResultItem(
+            focus_node=text(results_graph.value(result, SH.focusNode)) or "",
+            result_path=text(results_graph.value(result, SH.resultPath)),
+            value=text(results_graph.value(result, SH.value)),
+            message=text(results_graph.value(result, SH.resultMessage)),
+            severity=(text(results_graph.value(result, SH.resultSeverity)) or "").rsplit("#", 1)[-1].removeprefix("sh:"),
+            constraint=(text(results_graph.value(result, SH.sourceConstraintComponent)) or "").rsplit("#", 1)[-1].removeprefix("sh:") or None,
+        )
+        for result in results_graph.subjects(RDF.type, SH.ValidationResult)
+    ]
+    results.sort(key=lambda item: (item.focus_node, item.result_path or "", item.message or "", item.value or ""))
+    return ShaclValidationReport(
+        conforms=bool(conforms),
+        violation_count=sum(1 for item in results if item.severity == "Violation"),
+        profile_identifier=profile_identifier,
+        profile_version=profile_version,
+        results=results,
     )
 
 
@@ -294,10 +377,17 @@ def export_document_to_jsonld(
     document: dict[str, Any],
     jsonld_context: dict[str, Any],
     target_class: str,
+    json_schema: dict[str, Any] | None = None,
 ) -> JsonLdExportResult:
     clean_document = remove_null_values(document)
     if not isinstance(clean_document, dict):
         raise ValueError("JSON-LD export requires an object document.")
+    if json_schema is not None:
+        clean_document = annotate_document_types(
+            document=clean_document,
+            json_schema=json_schema,
+            target_class=target_class,
+        )
 
     context_body = jsonld_context.get("@context", jsonld_context)
     jsonld_document = {
@@ -317,6 +407,7 @@ def export_document_to_jsonld(
     # rdflib's JSON-LD serializer drops blank-node objects reached through
     # @id-coerced terms (e.g. several terms mapped to prov:used), losing their
     # triples. Skolemized nodes are kept, so JSON-LD and Turtle stay identical.
+    parsed = _rebase_local_iris(parsed, JSONLD_DOCUMENT_BASE_IRI)
     graph = parsed.skolemize(new_graph=Graph(namespace_manager=parsed.namespace_manager))
     serialized = graph.serialize(
         format="json-ld",
@@ -332,17 +423,106 @@ def export_document_to_jsonld(
     )
 
 
+def annotate_document_types(
+    *,
+    document: dict[str, Any],
+    json_schema: dict[str, Any],
+    target_class: str,
+) -> dict[str, Any]:
+    """Return a copy of ``document`` with ``@type`` set on every nested object.
+
+    The class of each object is taken from the profile's JSON Schema (the
+    LinkML range of the slot). The LinkML JSON-LD context defines every class
+    name as a term, so ``"@type": "<ClassName>"`` resolves to the class URI and
+    activates the class-scoped context. Without it nested nodes carry no
+    ``rdf:type`` and SHACL shapes (selected via ``sh:targetClass``) never
+    apply to them. Existing ``@type`` values are kept.
+    """
+
+    definitions = json_schema.get("$defs", {})
+    if not isinstance(definitions, dict):
+        return deepcopy(document)
+    return _annotate_object(deepcopy(document), target_class, definitions)
+
+
+def _annotate_object(
+    value: dict[str, Any],
+    class_name: str,
+    definitions: dict[str, Any],
+) -> dict[str, Any]:
+    if class_name in definitions:
+        value.setdefault("@type", class_name)
+    class_schema = definitions.get(class_name)
+    properties = class_schema.get("properties", {}) if isinstance(class_schema, dict) else {}
+    if not isinstance(properties, dict):
+        return value
+    for key, item in value.items():
+        if key.startswith("@"):
+            continue
+        range_class = _range_class_name(properties.get(key))
+        if range_class is None:
+            continue
+        if isinstance(item, dict):
+            _annotate_object(item, range_class, definitions)
+        elif isinstance(item, list):
+            for element in item:
+                if isinstance(element, dict):
+                    _annotate_object(element, range_class, definitions)
+    return value
+
+
+def _range_class_name(property_schema: Any) -> str | None:
+    """Class name a JSON Schema property refers to, if it is unambiguous."""
+
+    if not isinstance(property_schema, dict):
+        return None
+    if "items" in property_schema:
+        return _range_class_name(property_schema["items"])
+    candidates: set[str] = set()
+    ref = property_schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        candidates.add(ref.removeprefix("#/$defs/"))
+    for keyword in ("anyOf", "oneOf"):
+        for option in property_schema.get(keyword) or []:
+            option_class = _range_class_name(option)
+            if option_class is not None:
+                candidates.add(option_class)
+    return candidates.pop() if len(candidates) == 1 else None
+
+
+def _rebase_local_iris(graph: Graph, base_iri: str) -> Graph:
+    """Rebase subject/object IRIs whose scheme is not a global IRI scheme."""
+
+    def rebase(term: Any) -> Any:
+        if isinstance(term, URIRef):
+            scheme = str(term).split(":", 1)[0].lower()
+            if scheme not in GLOBAL_IRI_SCHEMES:
+                return URIRef(base_iri + quote(str(term), safe=":/#?&=@!$'()*+,;-._~%"))
+        return term
+
+    rebased = Graph(namespace_manager=graph.namespace_manager)
+    for subject, predicate, obj in graph:
+        rebased.add((rebase(subject), predicate, rebase(obj)))
+    return rebased
+
+
 def export_profile_document(
     *,
     document: dict[str, Any],
     jsonld_context: dict[str, Any],
     target_class: str,
+    json_schema: dict[str, Any] | None = None,
+    shacl_shapes: Graph | None = None,
+    profile_identifier: str | None = None,
+    profile_version: str | None = None,
 ) -> ProfileDocumentExport:
     """Serialize a profile document as JSON, YAML, JSON-LD and Turtle.
 
     Each format is produced independently, so a document that cannot be
     interpreted as JSON-LD (and therefore not as Turtle) still yields JSON and
-    YAML. Failures are reported in ``errors`` instead of being raised.
+    YAML. Failures are reported in ``errors`` instead of being raised. With
+    ``shacl_shapes`` the exported graph (exactly what the Turtle file holds)
+    is also validated and reported as format ``shacl``.
     """
 
     export = ProfileDocumentExport()
@@ -363,19 +543,42 @@ def export_profile_document(
             document=document,
             jsonld_context=jsonld_context,
             target_class=target_class,
+            json_schema=json_schema,
         )
+        assert jsonld.graph is not None
+        graph = jsonld.graph
     except Exception as exc:
         message = _export_error_message(exc)
         export.errors["jsonld"] = message
         export.errors["ttl"] = message
+        if shacl_shapes is not None:
+            export.errors["shacl"] = message
         return export
     export.contents["jsonld"] = json.dumps(jsonld.document, ensure_ascii=False, indent=2)
     export.triple_count = jsonld.triple_count
     try:
-        assert jsonld.graph is not None
-        export.contents["ttl"] = jsonld.graph.serialize(format="turtle")
+        export.contents["ttl"] = graph.serialize(format="turtle")
     except Exception as exc:
         export.errors["ttl"] = _export_error_message(exc)
+    if shacl_shapes is not None:
+        try:
+            # Validate what the Turtle file actually holds: rdflib's JSON-LD
+            # parser can keep coerced literals (e.g. JSON -20 as xsd:float) in a
+            # form pyshacl rejects, while the serialized file is well-typed.
+            validated = graph
+            if "ttl" in export.contents:
+                validated = Graph(namespace_manager=graph.namespace_manager)
+                validated.parse(data=export.contents["ttl"], format="turtle")
+            report = validate_graph_against_shacl(
+                graph=validated,
+                shapes=shacl_shapes,
+                profile_identifier=profile_identifier,
+                profile_version=profile_version,
+            )
+            export.shacl_report = report
+            export.contents["shacl"] = report.model_dump_json(indent=2)
+        except Exception as exc:
+            export.errors["shacl"] = _export_error_message(exc)
     return export
 
 

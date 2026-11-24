@@ -7,6 +7,7 @@ const FORMATS: Array<{ format: DocumentExportFormat; label: string }> = [
   { format: 'yaml', label: 'YAML' },
   { format: 'jsonld', label: 'JSON-LD' },
   { format: 'ttl', label: 'TTL' },
+  { format: 'shacl', label: 'SHACL report' },
 ];
 
 export function DocumentDownloadButtons({
@@ -46,7 +47,7 @@ export function DocumentDownloadButtons({
   return (
     <div
       className="document-download-buttons"
-      title="Downloads the curated document if one was saved, otherwise the generated draft."
+      title="Downloads the curated document if one was saved, otherwise the generated draft. The SHACL report validates its RDF graph against the registered profile's shapes."
     >
       <span>Download</span>
       {FORMATS.map(({ format, label }) => (

@@ -67,7 +67,7 @@ GROUNDED_VALIDATION_FILE = "grounded_validation.json"
 GROUNDED_FINAL_DRAFT_FILE = "grounded_final_draft.json"
 ARTIFACT_INDEX_FILE = "artifact_index.json"
 DOCUMENT_EXPORT_DIR = "export"
-DOCUMENT_EXPORT_EXTENSIONS = {"yaml": ".yaml", "jsonld": ".jsonld", "ttl": ".ttl"}
+DOCUMENT_EXPORT_EXTENSIONS = {"yaml": ".yaml", "jsonld": ".jsonld", "ttl": ".ttl", "shacl": ".shacl.json"}
 
 
 class FileSystemExtractionOutputRepository:

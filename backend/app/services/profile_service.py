@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from fastapi import UploadFile
+from rdflib import Graph
 
 from app.domain.profiles import (
     JsonLdExportResult,
@@ -18,6 +21,7 @@ from app.domain.profiles import (
     export_document_to_jsonld,
     export_profile_document,
     generate_profile_artifacts,
+    generate_shacl_shapes,
     validate_document_against_profile,
     validate_profile_identifier,
 )
@@ -27,6 +31,9 @@ from app.repositories.profile_repository import ProfileRepository
 class ProfileService:
     def __init__(self, profile_repository: ProfileRepository):
         self.profile_repository = profile_repository
+        # Parsed SHACL shapes per (identifier, checksum); parsing ~2k lines of
+        # Turtle on every export would dominate the export time.
+        self._shacl_shape_graphs: dict[tuple[str, str], Graph] = {}
 
     async def register_profile(
         self,
@@ -121,6 +128,31 @@ class ProfileService:
             target_class=manifest.target_class,
         )
 
+    def load_shacl_shape_graph(self, identifier: str) -> Graph:
+        """SHACL shapes of the registered profile version.
+
+        Profiles registered before shapes were stored get them generated once
+        from their merged schema and persisted next to the other artifacts.
+        """
+        manifest = self.get_profile(identifier)
+        cache_key = (identifier, manifest.checksum)
+        cached = self._shacl_shape_graphs.get(cache_key)
+        if cached is not None:
+            return cached
+        shapes = self.profile_repository.load_shacl_shapes(identifier)
+        if shapes is None:
+            with TemporaryDirectory() as temporary_directory:
+                merged_schema_path = Path(temporary_directory) / "merged_schema.yaml"
+                merged_schema_path.write_text(
+                    self.profile_repository.load_merged_schema(identifier),
+                    encoding="utf-8",
+                )
+                shapes = generate_shacl_shapes(merged_schema_path)
+            self.profile_repository.save_shacl_shapes(identifier, shapes)
+        graph = Graph().parse(data=shapes, format="turtle")
+        self._shacl_shape_graphs[cache_key] = graph
+        return graph
+
     def export_jsonld(
         self,
         *,
@@ -133,6 +165,7 @@ class ProfileService:
             document=document,
             jsonld_context=jsonld_context,
             target_class=manifest.target_class,
+            json_schema=self.profile_repository.load_json_schema(identifier),
         )
 
     def export_document_formats(
@@ -147,6 +180,10 @@ class ProfileService:
             document=document,
             jsonld_context=jsonld_context,
             target_class=manifest.target_class,
+            json_schema=self.profile_repository.load_json_schema(identifier),
+            shacl_shapes=self.load_shacl_shape_graph(identifier),
+            profile_identifier=identifier,
+            profile_version=manifest.version,
         )
 
     async def _load_schema_from_upload(

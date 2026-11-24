@@ -24,3 +24,9 @@ class ProfileRepository(Protocol):
 
     def load_jsonld_context(self, identifier: str) -> dict[str, Any]:
         ...
+
+    def load_shacl_shapes(self, identifier: str) -> str | None:
+        ...
+
+    def save_shacl_shapes(self, identifier: str, shapes: str) -> None:
+        ...

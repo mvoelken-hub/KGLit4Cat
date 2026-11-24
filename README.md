@@ -252,6 +252,7 @@ Each stage writes into `<stage>/<chunking_strategy>/<model>/`, for example `prof
 | `result/<strategy>/<model>/curated_document.json` | Curated document, written only after a user saves an edit or a curation field action |
 | `result/<strategy>/<model>/export/draft.{yaml,jsonld,ttl}` | Exports of the generated draft |
 | `result/<strategy>/<model>/export/curated.{yaml,jsonld,ttl}` | Exports of the curated document |
+| `result/<strategy>/<model>/export/{draft,curated}.shacl.json` | SHACL validation report of the exported RDF graph |
 
 Exports are rewritten automatically whenever the draft or curated JSON is saved:
 
@@ -259,15 +260,29 @@ Exports are rewritten automatically whenever the draft or curated JSON is saved:
 - **JSON-LD** is the document compacted with the profile's LinkML JSON-LD context (`profiles/<profile>/jsonld_context.json`).
 - **Turtle** is serialized from the same RDF graph as the JSON-LD, so both contain the same triples.
 
+The RDF graph follows the profile's LinkML schema rather than only its JSON-LD context:
+
+- Every nested object gets the `rdf:type` of its LinkML range class, taken from the profile's JSON Schema. For example, an object under `was_generated_by` with range `DataGeneratingActivity` becomes a `prov:Activity`. Without these types, SHACL shapes (selected via `sh:targetClass`) would never check nested nodes.
+- SIMONE ids such as `<package_id>:activity:<slug>` are not global IRIs. In RDF they are rebased onto `urn:simone:document/`, for example `urn:simone:document/fde6f638:activity:dataset-generation`. Ids that already use `http`, `https`, `urn`, `doi`, or a similar global scheme are kept. The JSON and YAML files keep the original ids.
+- Blank nodes are skolemized (`https://rdflib.github.io/.well-known/genid/...`). Otherwise rdflib's JSON-LD serializer drops nested objects that several terms map onto the same property.
+
+#### SHACL report
+
+The workflow validates with the profile's JSON Schema (shown as "valid" in the UI). In addition, each export validates the exported RDF graph against SHACL shapes generated with LinkML `gen-shacl` from the registered profile. The shapes are stored as `profiles/<profile>/shacl_shapes.ttl`. Profiles registered earlier get them generated on first use. The report therefore always refers to the profile version the workflow actually uses. Its `profile_version` field names that version, for example `0.1.0rc4.post33.dev0+b75744da` for the current dca-ap-plus registration.
+
+The report does not block the workflow. If the graph does not conform, one summary warning per document is added to `extraction_warnings.json`. It replaces the previous summary for that document and is removed once the document conforms.
+
+With dca-ap-plus, full conformance is currently not reachable even for documents that pass LinkML validation. The schema maps several slots (`realized_plan`, `evaluated_entity`, and others) onto `prov:used`, and `rdf_type` has the range `DefinedTerm`. `gen-shacl` turns both into constraints that a single value cannot satisfy at the same time. Treat such results as schema findings, not as extraction errors.
+
 If a format cannot be produced, for example because an incomplete draft is not valid JSON-LD, the workflow continues. The failure is logged and added to `extraction_warnings.json`, the other formats are still written, and any stale file of the failed format is removed.
 
-To download the current document in the web UI, use the **Download** buttons (JSON, YAML, JSON-LD, TTL) next to the generated draft. The same download is available over the API:
+To download the current document in the web UI, use the **Download** buttons (JSON, YAML, JSON-LD, TTL, SHACL report) next to the generated draft. The same download is available over the API:
 
 ```bash
 curl -OJ "http://127.0.0.1:8000/api/v1/extraction/results/<package_id>/document?format=ttl&chat_model=gemma4:26b"
 ```
 
-`format` is one of `json` (default), `yaml`, `jsonld`, or `ttl`. The response is the curated document if one was saved, otherwise the generated draft. It is served as `application/json`, `application/yaml`, `application/ld+json`, or `text/turtle`, with a `Content-Disposition` filename like `<package_id>_draft.ttl`. The endpoint returns 404 when no draft exists yet and 422 when the document cannot be converted to the requested format.
+`format` is one of `json` (default), `yaml`, `jsonld`, `ttl`, or `shacl`. The response is the curated document if one was saved, otherwise the generated draft. It is served as `application/json`, `application/yaml`, `application/ld+json`, `text/turtle`, or (for the SHACL report) `application/json`, with a `Content-Disposition` filename like `<package_id>_draft.ttl`. The endpoint returns 404 when no draft exists yet and 422 when the document cannot be converted to the requested format.
 
 ### Ollama Cloud Sign-In
 
