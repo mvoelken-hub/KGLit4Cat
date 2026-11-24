@@ -11,10 +11,12 @@ from app.domain.profiles import (
     JsonLdExportResult,
     ProfileAlreadyExistsError,
     ProfileManifest,
+    ProfileDocumentExport,
     ProfileNotFoundError,
     ProfileSourceError,
     ProfileValidationResult,
     export_document_to_jsonld,
+    export_profile_document,
     generate_profile_artifacts,
     validate_document_against_profile,
     validate_profile_identifier,
@@ -128,6 +130,20 @@ class ProfileService:
         manifest = self.get_profile(identifier)
         jsonld_context = self.profile_repository.load_jsonld_context(identifier)
         return export_document_to_jsonld(
+            document=document,
+            jsonld_context=jsonld_context,
+            target_class=manifest.target_class,
+        )
+
+    def export_document_formats(
+        self,
+        *,
+        identifier: str,
+        document: dict,
+    ) -> ProfileDocumentExport:
+        manifest = self.get_profile(identifier)
+        jsonld_context = self.profile_repository.load_jsonld_context(identifier)
+        return export_profile_document(
             document=document,
             jsonld_context=jsonld_context,
             target_class=manifest.target_class,

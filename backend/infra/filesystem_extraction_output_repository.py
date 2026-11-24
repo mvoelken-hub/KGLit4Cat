@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.domain.extraction import (
     CurationLedgerRecord,
@@ -66,6 +66,8 @@ GROUNDING_POLICY_FILE = "grounding_policy.json"
 GROUNDED_VALIDATION_FILE = "grounded_validation.json"
 GROUNDED_FINAL_DRAFT_FILE = "grounded_final_draft.json"
 ARTIFACT_INDEX_FILE = "artifact_index.json"
+DOCUMENT_EXPORT_DIR = "export"
+DOCUMENT_EXPORT_EXTENSIONS = {"yaml": ".yaml", "jsonld": ".jsonld", "ttl": ".ttl"}
 
 
 class FileSystemExtractionOutputRepository:
@@ -375,6 +377,32 @@ class FileSystemExtractionOutputRepository:
             self._result_dir(workflow_id, chunking_strategy, chat_model) / CURATED_DOCUMENT_FILE,
             document,
         )
+
+    def save_document_exports(
+        self,
+        *,
+        workflow_id: str,
+        document_name: Literal["draft", "curated"],
+        exports: dict[str, str | None],
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> None:
+        """Write serialized document variants to ``result/<strategy>/<model>/export/``.
+
+        A ``None`` value marks a format that could not be produced; any stale
+        file from an earlier run is removed so exports never mix versions.
+        """
+        export_dir = self._result_dir(workflow_id, chunking_strategy, chat_model) / DOCUMENT_EXPORT_DIR
+        for export_format, content in exports.items():
+            extension = DOCUMENT_EXPORT_EXTENSIONS.get(export_format)
+            if extension is None:
+                raise ValueError(f"Unsupported document export format: {export_format}")
+            path = export_dir / f"{document_name}{extension}"
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                self._write_text_file(path, content)
+        self._refresh_artifact_index(workflow_id)
 
     def load_curated_document(
         self,
@@ -865,8 +893,12 @@ class FileSystemExtractionOutputRepository:
         with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
 
+    @classmethod
+    def _write_json_file(cls, path: Path, content: Any) -> None:
+        cls._write_text_file(path, json.dumps(content, ensure_ascii=False, indent=2))
+
     @staticmethod
-    def _write_json_file(path: Path, content: Any) -> None:
+    def _write_text_file(path: Path, content: str) -> None:
         path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
@@ -880,7 +912,7 @@ class FileSystemExtractionOutputRepository:
                 delete=False,
             ) as file:
                 temp_path = Path(file.name)
-                json.dump(content, file, ensure_ascii=False, indent=2)
+                file.write(content)
                 file.flush()
                 os.fsync(file.fileno())
             _atomic_replace(temp_path, path)

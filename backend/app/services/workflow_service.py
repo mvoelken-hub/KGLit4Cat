@@ -913,6 +913,65 @@ class WorkflowService(
                 f"Extraction result not found for workflow '{data_package_id}'."
             ) from exc
 
+    async def get_document_export(
+        self,
+        *,
+        data_package_id: str,
+        export_format: DocumentExportFormat,
+        chunking_strategy: str | None = None,
+        chat_model: str | None = None,
+    ) -> tuple[Literal["draft", "curated"], str]:
+        """Return the current profile document of a branch in the requested format.
+
+        The curated document wins when one was saved; otherwise the persisted
+        reconstructed draft is used.
+        """
+        if self.output_repository is None:
+            raise ExtractionResultNotFoundError("Extraction output repository is unavailable.")
+        branch_model = chat_model or self._current_chat_model()
+        state = self._load_run_state_or_none(
+            data_package_id,
+            chunking_strategy=chunking_strategy or "semantic",
+            chat_model=branch_model,
+        )
+        if state is None or not state.profile_identifier:
+            raise ExtractionResultNotFoundError(
+                f"No profile run found for workflow '{data_package_id}'. Build the generated draft first."
+            )
+        resolved_model = state.chat_model or branch_model
+        resolved_strategy = chunking_strategy or state.chunking_strategy
+        document_name: Literal["draft", "curated"]
+        try:
+            document = self.output_repository.load_curated_document(
+                data_package_id,
+                chat_model=resolved_model,
+                chunking_strategy=resolved_strategy,
+            )
+            document_name = "curated"
+        except FileNotFoundError:
+            try:
+                document = self.output_repository.load_generated_final_draft(
+                    data_package_id,
+                    chat_model=resolved_model,
+                    chunking_strategy=resolved_strategy,
+                )
+            except FileNotFoundError as exc:
+                raise ExtractionResultNotFoundError(
+                    f"No generated draft found for workflow '{data_package_id}'."
+                ) from exc
+            document_name = "draft"
+        export = self.profile_service.export_document_formats(
+            identifier=state.profile_identifier,
+            document=document,
+        )
+        content = export.contents.get(export_format)
+        if content is None:
+            raise DocumentExportError(
+                f"Could not export the {document_name} document as {export_format}: "
+                f"{export.errors.get(export_format, 'unknown error')}"
+            )
+        return document_name, content
+
     async def get_token_usage(
         self,
         data_package_id: str,

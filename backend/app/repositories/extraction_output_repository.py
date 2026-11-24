@@ -1,4 +1,4 @@
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from app.domain.extraction import (
     CurationLedgerRecord,
@@ -185,6 +185,16 @@ class ExtractionOutputRepository(Protocol):
         *,
         workflow_id: str,
         document: dict[str, Any],
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> None: ...
+
+    def save_document_exports(
+        self,
+        *,
+        workflow_id: str,
+        document_name: Literal["draft", "curated"],
+        exports: dict[str, str | None],
         chat_model: str | None = None,
         chunking_strategy: str = "semantic",
     ) -> None: ...

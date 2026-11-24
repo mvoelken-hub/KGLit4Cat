@@ -8,16 +8,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
+import yaml
 from jsonschema import Draft201909Validator
 from linkml.generators.jsonldcontextgen import ContextGenerator
 from linkml.generators.jsonschemagen import JsonSchemaGenerator
 from linkml_runtime.dumpers import yaml_dumper
 from linkml_runtime.utils.schemaview import SchemaView
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from rdflib import Graph
 
 
 PROFILE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+JSONLD_DOCUMENT_BASE_IRI = "urn:simone:document/"
 DEFAULT_ENRICHABLE_FIELD_CANDIDATES = frozenset(
     {"type", "has_quantity_type", "unit"}
 )
@@ -45,6 +47,10 @@ class ProfileSourceError(ProfileError):
 
 class ProfileCompatibilityError(ProfileError):
     pass
+
+
+class DocumentExportError(ProfileError):
+    """Raised when a profile document cannot be serialized to a requested format."""
 
 
 ProfileSourceType = Literal["url", "upload"]
@@ -82,8 +88,29 @@ class ProfileValidationResult(BaseModel):
 
 
 class JsonLdExportResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     document: dict[str, Any]
     triple_count: int
+    # The rdflib graph the JSON-LD was serialized from. Excluded from dumps so
+    # API responses stay unchanged; reused for further RDF serializations.
+    graph: Graph | None = Field(default=None, exclude=True)
+
+
+DocumentExportFormat = Literal["json", "yaml", "jsonld", "ttl"]
+DOCUMENT_EXPORT_FORMATS: tuple[DocumentExportFormat, ...] = ("json", "yaml", "jsonld", "ttl")
+
+
+class ProfileDocumentExport(BaseModel):
+    """Serialized variants of one profile document.
+
+    ``contents`` holds every format that could be produced, ``errors`` the
+    failure message for every format that could not.
+    """
+
+    contents: dict[DocumentExportFormat, str] = Field(default_factory=dict)
+    errors: dict[DocumentExportFormat, str] = Field(default_factory=dict)
+    triple_count: int | None = None
 
 
 def validate_profile_identifier(identifier: str) -> str:
@@ -279,8 +306,18 @@ def export_document_to_jsonld(
     }
     jsonld_document.setdefault("@type", target_class)
 
-    graph = Graph()
-    graph.parse(data=json.dumps(jsonld_document), format="json-ld")
+    parsed = Graph()
+    # Without an explicit base rdflib resolves relative ids against the
+    # process working directory (file:///...), which is machine dependent.
+    parsed.parse(
+        data=json.dumps(jsonld_document),
+        format="json-ld",
+        base=JSONLD_DOCUMENT_BASE_IRI,
+    )
+    # rdflib's JSON-LD serializer drops blank-node objects reached through
+    # @id-coerced terms (e.g. several terms mapped to prov:used), losing their
+    # triples. Skolemized nodes are kept, so JSON-LD and Turtle stay identical.
+    graph = parsed.skolemize(new_graph=Graph(namespace_manager=parsed.namespace_manager))
     serialized = graph.serialize(
         format="json-ld",
         context=context_body,
@@ -291,7 +328,59 @@ def export_document_to_jsonld(
     return JsonLdExportResult(
         document=compact_document,
         triple_count=len(graph),
+        graph=graph,
     )
+
+
+def export_profile_document(
+    *,
+    document: dict[str, Any],
+    jsonld_context: dict[str, Any],
+    target_class: str,
+) -> ProfileDocumentExport:
+    """Serialize a profile document as JSON, YAML, JSON-LD and Turtle.
+
+    Each format is produced independently, so a document that cannot be
+    interpreted as JSON-LD (and therefore not as Turtle) still yields JSON and
+    YAML. Failures are reported in ``errors`` instead of being raised.
+    """
+
+    export = ProfileDocumentExport()
+    try:
+        export.contents["json"] = json.dumps(document, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        export.errors["json"] = _export_error_message(exc)
+    try:
+        export.contents["yaml"] = yaml.safe_dump(
+            document,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    except Exception as exc:
+        export.errors["yaml"] = _export_error_message(exc)
+    try:
+        jsonld = export_document_to_jsonld(
+            document=document,
+            jsonld_context=jsonld_context,
+            target_class=target_class,
+        )
+    except Exception as exc:
+        message = _export_error_message(exc)
+        export.errors["jsonld"] = message
+        export.errors["ttl"] = message
+        return export
+    export.contents["jsonld"] = json.dumps(jsonld.document, ensure_ascii=False, indent=2)
+    export.triple_count = jsonld.triple_count
+    try:
+        assert jsonld.graph is not None
+        export.contents["ttl"] = jsonld.graph.serialize(format="turtle")
+    except Exception as exc:
+        export.errors["ttl"] = _export_error_message(exc)
+    return export
+
+
+def _export_error_message(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 def remove_null_values(value: Any) -> Any:

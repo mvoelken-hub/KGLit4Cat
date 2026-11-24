@@ -6422,6 +6422,15 @@ class ProjectionService:
             chunking_strategy=state.chunking_strategy,
             chat_model=state.chat_model,
         )
+        # Exports mirror the documents save_extraction_result writes below.
+        export_warnings = self._persist_document_exports(
+            data_package_id,
+            state,
+            draft=clean_document,
+            curated=state.curated_document,
+            persist_warnings=False,
+        )
+        warnings = warnings + [warning for warning in export_warnings if warning not in warnings]
         result = ExtractionRunResult(
             generated_final_draft=clean_document,
             machine_evidence_context=evidence_context,
@@ -6905,6 +6914,70 @@ class ProjectionService:
             chat_model=chat_model,
             chunking_strategy=chunking_strategy,
         )
+        self._persist_document_exports(
+            data_package_id,
+            state,
+            draft=state.generated_reconstructed_draft,
+            curated=state.curated_document,
+        )
+
+    def _persist_document_exports(
+        self,
+        data_package_id: str,
+        state: ExtractionRunState,
+        *,
+        draft: dict[str, Any] | None,
+        curated: dict[str, Any] | None,
+        persist_warnings: bool = True,
+    ) -> list[str]:
+        """Write YAML/JSON-LD/Turtle exports next to the persisted JSON documents.
+
+        Export failures never interrupt the workflow: they are logged and
+        returned (and, by default, appended to ``extraction_warnings.json``).
+        """
+        if self.output_repository is None or not state.profile_identifier:
+            return []
+        warnings: list[str] = []
+        for document_name, document in (("draft", draft), ("curated", curated)):
+            if document is None:
+                continue
+            try:
+                export = self.profile_service.export_document_formats(
+                    identifier=state.profile_identifier,
+                    document=document,
+                )
+            except Exception as exc:
+                warnings.append(f"Export of {document_name} document failed: {exc}")
+                continue
+            for export_format, message in export.errors.items():
+                if export_format != "json":
+                    warnings.append(
+                        f"Export of {document_name} document as {export_format} failed: {message}"
+                    )
+            try:
+                self.output_repository.save_document_exports(
+                    workflow_id=data_package_id,
+                    document_name=document_name,
+                    exports={
+                        export_format: export.contents.get(export_format)
+                        for export_format in ("yaml", "jsonld", "ttl")
+                    },
+                    chat_model=state.chat_model,
+                    chunking_strategy=state.chunking_strategy,
+                )
+            except Exception as exc:
+                warnings.append(f"Writing {document_name} document exports failed: {exc}")
+        for warning in warnings:
+            logger.warning("%s (workflow '%s')", warning, data_package_id)
+        if warnings and persist_warnings:
+            existing = self._load_warnings_or_empty(data_package_id)
+            merged = existing + [warning for warning in warnings if warning not in existing]
+            if merged != existing:
+                self.output_repository.save_extraction_warnings(
+                    workflow_id=data_package_id,
+                    warnings=merged,
+                )
+        return warnings
 
     def _clear_downstream_extraction_outputs(self, data_package_id: str) -> None:
         if self.output_repository is None:

@@ -215,6 +215,8 @@ from app.domain.extraction import (
     validate_evidence_candidates,
 )
 from app.domain.profiles import (
+    DocumentExportError,
+    DocumentExportFormat,
     ProfileValidationIssue,
     remove_null_values,
     validate_document_against_profile,

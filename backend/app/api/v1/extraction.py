@@ -1,8 +1,9 @@
 import json
+import re
 from io import BytesIO
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
 from app.core.task_registry import TaskStatus
 from app.api.v1.schemas import (
@@ -33,6 +34,8 @@ from app.domain.extraction import (
     ExtractionValidationError,
 )
 from app.domain.profiles import (
+    DocumentExportError,
+    DocumentExportFormat,
     InvalidProfileIdentifierError,
     ProfileCompatibilityError,
     ProfileNotFoundError,
@@ -44,6 +47,13 @@ from app.services.workflow_service import WorkflowService
 
 
 router = APIRouter(prefix="/extraction", tags=["Extraction"])
+
+DOCUMENT_EXPORT_MEDIA_TYPES: dict[str, tuple[str, str]] = {
+    "json": ("application/json", ".json"),
+    "yaml": ("application/yaml", ".yaml"),
+    "jsonld": ("application/ld+json", ".jsonld"),
+    "ttl": ("text/turtle", ".ttl"),
+}
 
 
 def _raise_extraction_error(exc: Exception) -> None:
@@ -65,6 +75,11 @@ def _raise_extraction_error(exc: Exception) -> None:
     if isinstance(exc, ChunkingRequiredError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    if isinstance(exc, DocumentExportError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
     if isinstance(exc, ExtractionValidationError):
@@ -504,6 +519,46 @@ async def get_extraction_result(
         )
     except Exception as exc:
         _raise_extraction_error(exc)
+
+
+@router.get(
+    "/results/{data_package_id}/document",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Curated document if saved, otherwise the generated draft.",
+            "content": {media_type: {} for media_type, _ in DOCUMENT_EXPORT_MEDIA_TYPES.values()},
+        }
+    },
+)
+async def download_extraction_document(
+    data_package_id: str,
+    format: DocumentExportFormat = Query(default="json", description="Export format."),
+    chunking_strategy: Literal["semantic", "fixed_tokens"] | None = None,
+    chat_model: str | None = None,
+    workflow_service: WorkflowService = Depends(get_workflow_service),
+) -> Response:
+    try:
+        document_name, content = await workflow_service.get_document_export(
+            data_package_id=data_package_id,
+            export_format=format,
+            chunking_strategy=chunking_strategy,
+            chat_model=chat_model,
+        )
+    except Exception as exc:
+        _raise_extraction_error(exc)
+        raise
+    media_type, extension = DOCUMENT_EXPORT_MEDIA_TYPES[format]
+    safe_package_id = re.sub(r"[^A-Za-z0-9._-]", "_", data_package_id)
+    file_name = f"{safe_package_id}_{document_name}{extension}"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type=f"{media_type}; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 
 
 @router.get("/workflows/{data_package_id}/token-usage")

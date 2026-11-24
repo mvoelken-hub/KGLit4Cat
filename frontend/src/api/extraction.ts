@@ -623,6 +623,24 @@ export async function getExtractionResult(data_package_id: string, chunking_stra
   return readJson(await response);
 }
 
+export type DocumentExportFormat = 'json' | 'yaml' | 'jsonld' | 'ttl';
+
+/** Downloads the curated document (or, if none was saved, the generated draft) in the given format. */
+export async function downloadExtractionDocument(
+  data_package_id: string,
+  format: DocumentExportFormat,
+  chunking_strategy?: ChunkingStrategy,
+  chat_model?: string | null,
+): Promise<{ blob: Blob; filename: string }> {
+  const response = await fetch(
+    apiBaseUrl + '/extraction/results/' + encodeURIComponent(data_package_id) + '/document' + buildQuery({ format, chunking_strategy, chat_model }),
+  );
+  if (!response.ok) await readJson(response);
+  const disposition = response.headers.get('content-disposition') ?? '';
+  const filename = /filename="?([^";]+)"?/i.exec(disposition)?.[1] ?? `${data_package_id}.${format}`;
+  return { blob: await response.blob(), filename };
+}
+
 export async function extractInitialContext(input: {
   data_package_id: string;
 }): Promise<InitialContext> {

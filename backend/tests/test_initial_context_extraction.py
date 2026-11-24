@@ -334,6 +334,9 @@ class FakeOutputRepository:
     def save_curated_document(self, *, workflow_id: str, document: dict, chat_model: str | None = None, **_kwargs):
         self.curated_document = document
 
+    def save_document_exports(self, *, workflow_id: str, document_name: str, exports: dict, **_kwargs):
+        self.document_exports = {**getattr(self, "document_exports", {}), document_name: exports}
+
     def load_curated_document(self, workflow_id: str, chat_model: str | None = None, **_kwargs) -> dict:
         if self.curated_document is None:
             raise FileNotFoundError

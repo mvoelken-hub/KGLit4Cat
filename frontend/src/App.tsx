@@ -36,6 +36,7 @@ import { ChunkingStatusPanel, ChunkInspectionPanel, FileViewer } from './compone
 import { VocabularyPanel } from './components/VocabularyPanel';
 import { WorkflowBranchBar, StepPanel, type WorkflowBranch } from './components/WorkflowPanels';
 import { JsonDetails } from './components/JsonDetails';
+import { DocumentDownloadButtons } from './components/DocumentDownloadButtons';
 import { InitialFileUnderstandingPanel } from './components/InitialUnderstandingPanels';
 import { EvidenceContextOverview, evidenceContextNoteCount } from './components/EvidenceContextPanels';
 import { TokenUsageSummary } from './components/TokenUsageSummary';
@@ -1593,6 +1594,15 @@ export function App() {
                   <>
                     <button className="ghost" onClick={() => setCuratedEditorOpen(true)} disabled={!curatedDocument}>Edit</button>
                     <button className="ghost draft-recreate-button" onClick={() => void onGenerateDraft({ mode: 'rebuild' })} disabled={!selectedPackageId || !selectedProfile || !!busy || isPatching}>{busy === 'draft' ? 'Rebuilding...' : isProfileBuildRunning ? 'Rebuilding...' : 'Rebuild generated draft'}</button>
+                    {selectedPackageId && (
+                      <DocumentDownloadButtons
+                        dataPackageId={selectedPackageId}
+                        chunkingStrategy={chunkViewStrategy}
+                        chatModel={workflowChatModel}
+                        disabled={isPatching}
+                        onError={setMessage}
+                      />
+                    )}
                   </>
                 )}
               </div>

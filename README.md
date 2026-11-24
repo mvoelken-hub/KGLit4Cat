@@ -235,6 +235,40 @@ simone down
 
 `status` shows Docker containers, local dev processes, vocabulary-bootstrap jobs, API health, and service URLs. `down` stops SIMONE containers, vocabulary-bootstrap jobs, and local development API/frontend processes.
 
+### Output Files and Export Formats
+
+Extraction outputs are written per data package below the API's output directory (`output_dir` in `backend/app/core/config.py`):
+
+| Mode | Output root |
+|---|---|
+| Docker (`simone up`) | `data/docker/api/data/output/<package_id>/` |
+| Development | `backend/.runtime/output/<package_id>/` |
+
+Each stage writes into `<stage>/<chunking_strategy>/<model>/`, for example `profile_draft/semantic/gemma4_26b/`. `artifact_index.json` in the package root lists every artifact with its stage, strategy, model, and size. The profile documents are:
+
+| File | Content |
+|---|---|
+| `profile_draft/<strategy>/<model>/generated_reconstructed_draft.json` | Generated profile draft |
+| `result/<strategy>/<model>/curated_document.json` | Curated document, written only after a user saves an edit or a curation field action |
+| `result/<strategy>/<model>/export/draft.{yaml,jsonld,ttl}` | Exports of the generated draft |
+| `result/<strategy>/<model>/export/curated.{yaml,jsonld,ttl}` | Exports of the curated document |
+
+Exports are rewritten automatically whenever the draft or curated JSON is saved:
+
+- **YAML** has the same content as the JSON, in document order and with Unicode kept as-is.
+- **JSON-LD** is the document compacted with the profile's LinkML JSON-LD context (`profiles/<profile>/jsonld_context.json`).
+- **Turtle** is serialized from the same RDF graph as the JSON-LD, so both contain the same triples.
+
+If a format cannot be produced, for example because an incomplete draft is not valid JSON-LD, the workflow continues. The failure is logged and added to `extraction_warnings.json`, the other formats are still written, and any stale file of the failed format is removed.
+
+To download the current document in the web UI, use the **Download** buttons (JSON, YAML, JSON-LD, TTL) next to the generated draft. The same download is available over the API:
+
+```bash
+curl -OJ "http://127.0.0.1:8000/api/v1/extraction/results/<package_id>/document?format=ttl&chat_model=gemma4:26b"
+```
+
+`format` is one of `json` (default), `yaml`, `jsonld`, or `ttl`. The response is the curated document if one was saved, otherwise the generated draft. It is served as `application/json`, `application/yaml`, `application/ld+json`, or `text/turtle`, with a `Content-Disposition` filename like `<package_id>_draft.ttl`. The endpoint returns 404 when no draft exists yet and 422 when the document cannot be converted to the requested format.
+
 ### Ollama Cloud Sign-In
 
 The default chat model is an Ollama Cloud model (`gemma4:31b-cloud`). On a fresh machine or after resetting the Ollama data volume, `/api/v1/health` may report the chat check as `unauthorized (status code: 401)`.
