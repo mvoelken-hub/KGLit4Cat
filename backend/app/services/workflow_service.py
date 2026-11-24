@@ -918,14 +918,85 @@ class WorkflowService(
         *,
         data_package_id: str,
         export_format: DocumentExportFormat,
+        stage: DocumentStage | Literal["auto"] = "auto",
         chunking_strategy: str | None = None,
         chat_model: str | None = None,
-    ) -> tuple[Literal["draft", "curated"], str]:
-        """Return the current profile document of a branch in the requested format.
+    ) -> tuple[DocumentStage, str]:
+        """Return a profile document of a branch in the requested format.
 
-        The curated document wins when one was saved; otherwise the persisted
-        reconstructed draft is used.
+        ``stage="auto"`` picks the most advanced document that exists: curated,
+        then grounded (vocabulary grounding, step 5), then the step-4 draft.
+        Returns the stage actually served and the serialized content.
         """
+        state, resolved_model, resolved_strategy = self._document_branch(
+            data_package_id=data_package_id,
+            chunking_strategy=chunking_strategy,
+            chat_model=chat_model,
+        )
+        assert state.profile_identifier is not None
+        candidates: tuple[DocumentStage, ...] = (
+            ("curated", "grounded", "draft") if stage == "auto" else (stage,)
+        )
+        for candidate in candidates:
+            document = self._load_stage_document(
+                data_package_id,
+                candidate,
+                chat_model=resolved_model,
+                chunking_strategy=resolved_strategy,
+            )
+            if document is not None:
+                break
+        else:
+            requested = "profile" if stage == "auto" else stage
+            raise ExtractionResultNotFoundError(
+                f"No {requested} document found for workflow '{data_package_id}'."
+            )
+        export = self.profile_service.export_document_formats(
+            identifier=state.profile_identifier,
+            document=document,
+        )
+        content = export.contents.get(export_format)
+        if content is None:
+            raise DocumentExportError(
+                f"Could not export the {candidate} document as {export_format}: "
+                f"{export.errors.get(export_format, 'unknown error')}"
+            )
+        return candidate, content
+
+    async def get_document_stages(
+        self,
+        *,
+        data_package_id: str,
+        chunking_strategy: str | None = None,
+        chat_model: str | None = None,
+    ) -> dict[DocumentStage, bool]:
+        """Which stage documents (draft, grounded, curated) exist for a branch."""
+        try:
+            _, resolved_model, resolved_strategy = self._document_branch(
+                data_package_id=data_package_id,
+                chunking_strategy=chunking_strategy,
+                chat_model=chat_model,
+            )
+        except ExtractionResultNotFoundError:
+            return {stage: False for stage in DOCUMENT_STAGES}
+        return {
+            stage: self._load_stage_document(
+                data_package_id,
+                stage,
+                chat_model=resolved_model,
+                chunking_strategy=resolved_strategy,
+            )
+            is not None
+            for stage in DOCUMENT_STAGES
+        }
+
+    def _document_branch(
+        self,
+        *,
+        data_package_id: str,
+        chunking_strategy: str | None,
+        chat_model: str | None,
+    ) -> tuple[ExtractionRunState, str | None, str]:
         if self.output_repository is None:
             raise ExtractionResultNotFoundError("Extraction output repository is unavailable.")
         branch_model = chat_model or self._current_chat_model()
@@ -938,39 +1009,30 @@ class WorkflowService(
             raise ExtractionResultNotFoundError(
                 f"No profile run found for workflow '{data_package_id}'. Build the generated draft first."
             )
-        resolved_model = state.chat_model or branch_model
-        resolved_strategy = chunking_strategy or state.chunking_strategy
-        document_name: Literal["draft", "curated"]
+        return state, state.chat_model or branch_model, chunking_strategy or state.chunking_strategy
+
+    def _load_stage_document(
+        self,
+        data_package_id: str,
+        stage: DocumentStage,
+        *,
+        chat_model: str | None,
+        chunking_strategy: str,
+    ) -> dict[str, Any] | None:
+        assert self.output_repository is not None
+        loaders = {
+            "draft": self.output_repository.load_generated_final_draft,
+            "grounded": self.output_repository.load_grounded_document,
+            "curated": self.output_repository.load_curated_document,
+        }
         try:
-            document = self.output_repository.load_curated_document(
+            return loaders[stage](
                 data_package_id,
-                chat_model=resolved_model,
-                chunking_strategy=resolved_strategy,
+                chat_model=chat_model,
+                chunking_strategy=chunking_strategy,
             )
-            document_name = "curated"
         except FileNotFoundError:
-            try:
-                document = self.output_repository.load_generated_final_draft(
-                    data_package_id,
-                    chat_model=resolved_model,
-                    chunking_strategy=resolved_strategy,
-                )
-            except FileNotFoundError as exc:
-                raise ExtractionResultNotFoundError(
-                    f"No generated draft found for workflow '{data_package_id}'."
-                ) from exc
-            document_name = "draft"
-        export = self.profile_service.export_document_formats(
-            identifier=state.profile_identifier,
-            document=document,
-        )
-        content = export.contents.get(export_format)
-        if content is None:
-            raise DocumentExportError(
-                f"Could not export the {document_name} document as {export_format}: "
-                f"{export.errors.get(export_format, 'unknown error')}"
-            )
-        return document_name, content
+            return None
 
     async def get_token_usage(
         self,
@@ -1040,6 +1102,7 @@ class WorkflowService(
         state.chunking_strategy = chunking_strategy
         if force_rebuild:
             self._clear_profile_projection_state(state)
+            self._clear_profile_stage_documents(data_package_id, state)
 
         warnings = self._load_warnings_or_empty(data_package_id)
         progress = ExtractionRunProgress(
@@ -1291,6 +1354,7 @@ class WorkflowService(
         )
         if force_profile_rebuild and target_stage in {"profile", "grounding", "complete"}:
             self._clear_profile_projection_state(state)
+            self._clear_profile_stage_documents(data_package_id, state)
         self._save_run_state(data_package_id, state)
 
         progress.chunk_repair_mode = state.chunk_repair_mode
@@ -1987,6 +2051,20 @@ class WorkflowService(
             workflow_id=data_package_id,
             state=state,
             chat_model=state.chat_model,
+            chunking_strategy=state.chunking_strategy,
+        )
+
+    def _clear_profile_stage_documents(
+        self,
+        data_package_id: str,
+        state: ExtractionRunState,
+    ) -> None:
+        """Drop grounded/curated documents and exports derived from a draft being rebuilt."""
+        if self.output_repository is None:
+            return
+        self.output_repository.clear_profile_stage_documents(
+            data_package_id,
+            chat_model=state.chat_model or self._current_chat_model(),
             chunking_strategy=state.chunking_strategy,
         )
 

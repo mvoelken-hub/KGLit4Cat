@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from app.domain.extraction import (
     CurationLedgerRecord,
@@ -30,6 +30,7 @@ from app.domain.extraction import (
     RequirementReport,
     RoutedEvidenceContext,
 )
+from app.domain.profiles import DocumentStage
 
 
 EVIDENCE_CONTEXT_FILE = "evidence_context.json"
@@ -144,9 +145,11 @@ class FileSystemExtractionOutputRepository:
             self.save_generated_core_draft(workflow_id=workflow_id, document=result.generated_core_draft, chat_model=chat_model, chunking_strategy=chunking_strategy)
         if result.generated_attribute_draft is not None:
             self.save_generated_attribute_draft(workflow_id=workflow_id, document=result.generated_attribute_draft, chat_model=chat_model, chunking_strategy=chunking_strategy)
+        # generated_reconstructed_draft.json holds the step-4 draft; the
+        # grounded document is stored by save_grounding_artifacts.
         self.save_generated_final_draft(
             workflow_id=workflow_id,
-            document=result.generated_final_draft,
+            document=result.generated_reconstructed_draft or result.generated_final_draft,
             chat_model=chat_model,
             chunking_strategy=chunking_strategy,
         )
@@ -382,7 +385,7 @@ class FileSystemExtractionOutputRepository:
         self,
         *,
         workflow_id: str,
-        document_name: Literal["draft", "curated"],
+        document_name: DocumentStage,
         exports: dict[str, str | None],
         chat_model: str | None = None,
         chunking_strategy: str = "semantic",
@@ -402,6 +405,45 @@ class FileSystemExtractionOutputRepository:
                 path.unlink(missing_ok=True)
             else:
                 self._write_text_file(path, content)
+        self._refresh_artifact_index(workflow_id)
+
+    def load_grounded_document(
+        self,
+        workflow_id: str,
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> dict[str, Any]:
+        path = self._branch_dir(workflow_id, "grounding", chunking_strategy, chat_model) / GROUNDED_FINAL_DRAFT_FILE
+        if not path.exists():
+            raise FileNotFoundError(f"Grounded document not found for workflow '{workflow_id}'.")
+        payload = self._read_json_file(path)
+        if not isinstance(payload, dict):
+            raise ValueError("Grounded document artifact is not a JSON object.")
+        return payload
+
+    def clear_profile_stage_documents(
+        self,
+        workflow_id: str,
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> None:
+        """Remove the grounded and curated documents (and their exports) of a branch.
+
+        Called when the step-4 draft is rebuilt: both were derived from the
+        previous draft and must not be served next to the new one.
+        """
+        result_dir = self._result_dir(workflow_id, chunking_strategy, chat_model)
+        stale = [
+            result_dir / CURATED_DOCUMENT_FILE,
+            self._branch_dir(workflow_id, "grounding", chunking_strategy, chat_model) / GROUNDED_FINAL_DRAFT_FILE,
+        ]
+        for document_name in ("grounded", "curated"):
+            stale.extend(
+                result_dir / DOCUMENT_EXPORT_DIR / f"{document_name}{extension}"
+                for extension in DOCUMENT_EXPORT_EXTENSIONS.values()
+            )
+        for path in stale:
+            path.unlink(missing_ok=True)
         self._refresh_artifact_index(workflow_id)
 
     def load_curated_document(

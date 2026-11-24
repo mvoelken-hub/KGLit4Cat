@@ -107,6 +107,10 @@ class JsonLdExportResult(BaseModel):
 
 
 DocumentExportFormat = Literal["json", "yaml", "jsonld", "ttl", "shacl"]
+# Workflow stage a profile document comes from: the step-4 draft (not grounded),
+# the vocabulary-grounded document of step 5, or the user-curated document.
+DocumentStage = Literal["draft", "grounded", "curated"]
+DOCUMENT_STAGES: tuple[DocumentStage, ...] = ("draft", "grounded", "curated")
 DOCUMENT_EXPORT_FORMATS: tuple[DocumentExportFormat, ...] = ("json", "yaml", "jsonld", "ttl", "shacl")
 
 SH = Namespace("http://www.w3.org/ns/shacl#")

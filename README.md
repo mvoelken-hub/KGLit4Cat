@@ -244,17 +244,19 @@ Extraction outputs are written per data package below the API's output directory
 | Docker (`simone up`) | `data/docker/api/data/output/<package_id>/` |
 | Development | `backend/.runtime/output/<package_id>/` |
 
-Each stage writes into `<stage>/<chunking_strategy>/<model>/`, for example `profile_draft/semantic/gemma4_26b/`. `artifact_index.json` in the package root lists every artifact with its stage, strategy, model, and size. The profile documents are:
+Each stage writes into `<stage>/<chunking_strategy>/<model>/`, for example `profile_draft/semantic/gemma4_26b/`. `artifact_index.json` in the package root lists every artifact with its stage, strategy, model, and size.
 
-| File | Content |
-|---|---|
-| `profile_draft/<strategy>/<model>/generated_reconstructed_draft.json` | Generated profile draft |
-| `result/<strategy>/<model>/curated_document.json` | Curated document, written only after a user saves an edit or a curation field action |
-| `result/<strategy>/<model>/export/draft.{yaml,jsonld,ttl}` | Exports of the generated draft |
-| `result/<strategy>/<model>/export/curated.{yaml,jsonld,ttl}` | Exports of the curated document |
-| `result/<strategy>/<model>/export/{draft,curated}.shacl.json` | SHACL validation report of the exported RDF graph |
+The profile document exists in three stages. Only the grounded and curated stages link values to shared vocabularies, so use those for the knowledge graph:
 
-Exports are rewritten automatically whenever the draft or curated JSON is saved:
+| Stage | Created by | Grounded | JSON | Exports in `result/<strategy>/<model>/export/` |
+|---|---|---|---|---|
+| `draft` | Step 4, profile projection | no: units, quantity kinds, and similar values are free text | `profile_draft/<strategy>/<model>/generated_reconstructed_draft.json` | `draft.{yaml,jsonld,ttl,shacl.json}` |
+| `grounded` | Step 5, vocabulary grounding | yes: values replaced by vocabulary terms with IRIs | `grounding/<strategy>/<model>/grounded_final_draft.json` | `grounded.{yaml,jsonld,ttl,shacl.json}` |
+| `curated` | A user saves an edit or a curation field action | yes, plus manual choices | `result/<strategy>/<model>/curated_document.json` | `curated.{yaml,jsonld,ttl,shacl.json}` |
+
+The draft exports are refreshed whenever the step-4 draft is saved, the grounded exports when grounding runs, and the curated exports when the curated document is saved. Rebuilding the step-4 draft removes the grounded and curated documents and their exports, because they were derived from the previous draft.
+
+Each stage is exported in these formats:
 
 - **YAML** has the same content as the JSON, in document order and with Unicode kept as-is.
 - **JSON-LD** is the document compacted with the profile's LinkML JSON-LD context (`profiles/<profile>/jsonld_context.json`).
@@ -270,19 +272,24 @@ The RDF graph follows the profile's LinkML schema rather than only its JSON-LD c
 
 The workflow validates with the profile's JSON Schema (shown as "valid" in the UI). In addition, each export validates the exported RDF graph against SHACL shapes generated with LinkML `gen-shacl` from the registered profile. The shapes are stored as `profiles/<profile>/shacl_shapes.ttl`. Profiles registered earlier get them generated on first use. The report therefore always refers to the profile version the workflow actually uses. Its `profile_version` field names that version, for example `0.1.0rc4.post33.dev0+b75744da` for the current dca-ap-plus registration.
 
-The report does not block the workflow. If the graph does not conform, one summary warning per document is added to `extraction_warnings.json` and to the workflow progress (`warnings` in the progress API response). It replaces the previous summary for that document and is removed once the document conforms. Export failure warnings of a document are likewise replaced by the next export. If the shapes cannot be generated or loaded, only the SHACL report is missing (with a warning); YAML, JSON-LD, and Turtle are still written, and profile registration does not fail because of it.
+The report does not block the workflow. If the grounded or curated graph does not conform, one summary warning per document is added to `extraction_warnings.json` and to the workflow progress (`warnings` in the progress API response). It replaces the previous summary for that document and is removed once the document conforms. The ungrounded draft only gets its `draft.shacl.json` report, without a warning, because free-text values are expected to violate the shapes. Export failure warnings of a document are likewise replaced by the next export. If the shapes cannot be generated or loaded, only the SHACL report is missing (with a warning); YAML, JSON-LD, and Turtle are still written, and profile registration does not fail because of it.
 
 With dca-ap-plus, full conformance is currently not reachable even for documents that pass LinkML validation. The schema maps several slots (`realized_plan`, `evaluated_entity`, and others) onto `prov:used`, and `rdf_type` has the range `DefinedTerm`. `gen-shacl` turns both into constraints that a single value cannot satisfy at the same time. Treat such results as schema findings, not as extraction errors.
 
 If a format cannot be produced, for example because an incomplete draft is not valid JSON-LD, the workflow continues. The failure is logged and added to `extraction_warnings.json`, the other formats are still written, and any stale file of the failed format is removed.
 
-To download the current document in the web UI, use the **Download** buttons (JSON, YAML, JSON-LD, TTL, SHACL report) next to the generated draft. The same download is available over the API:
+In the web UI, step 04 offers **Draft (not grounded)** downloads, and step 05 offers **Knowledge graph** downloads (curated if saved, otherwise grounded; available after grounding). Each offers JSON, YAML, JSON-LD, TTL, and the SHACL report. The same downloads are available over the API:
 
 ```bash
-curl -OJ "http://127.0.0.1:8000/api/v1/extraction/results/<package_id>/document?format=ttl&chat_model=gemma4:26b"
+curl -OJ "http://127.0.0.1:8000/api/v1/extraction/results/<package_id>/document?format=ttl&stage=auto&chat_model=gemma4:26b"
 ```
 
-`format` is one of `json` (default), `yaml`, `jsonld`, `ttl`, or `shacl`. The response is the curated document if one was saved, otherwise the generated draft. It is served as `application/json`, `application/yaml`, `application/ld+json`, `text/turtle`, or (for the SHACL report) `application/json`, with a `Content-Disposition` filename like `<package_id>_draft.ttl`. The endpoint returns 404 when no draft exists yet and 422 when the document cannot be converted to the requested format.
+- `format` is one of `json` (default), `yaml`, `jsonld`, `ttl`, or `shacl`.
+- `stage` is `auto` (default: curated, then grounded, then draft), `draft`, `grounded`, or `curated`.
+- The response is served as `application/json`, `application/yaml`, `application/ld+json`, `text/turtle`, or (for the SHACL report) `application/json`. The `Content-Disposition` filename names the stage, for example `<package_id>_grounded.ttl`, and the `X-Document-Stage` header states which stage was served.
+- The endpoint returns 404 when the requested stage (or, for `auto`, any stage) does not exist and 422 when the document cannot be converted to the requested format.
+
+`GET /api/v1/extraction/results/<package_id>/documents` lists which stages exist, for example `{"draft": true, "grounded": true, "curated": false}`.
 
 ### Ollama Cloud Sign-In
 

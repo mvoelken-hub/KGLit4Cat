@@ -13,7 +13,14 @@ from rdflib import Graph, Namespace, URIRef
 from rdflib.namespace import RDF
 
 from app.core.config import Settings
-from app.domain.extraction import ExtractionResultNotFoundError, ExtractionRunState
+from app.domain.extraction import (
+    DraftValidationResult,
+    ExtractionNormalization,
+    ExtractionResultNotFoundError,
+    ExtractionRunResult,
+    ExtractionRunState,
+    RoutedEvidenceContext,
+)
 from app.domain.profiles import (
     DocumentExportError,
     _list_terms,
@@ -371,6 +378,53 @@ class DocumentExportRepositoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 repo.save_document_exports(workflow_id="pkg", document_name="draft", exports={"xml": "<x/>"})
 
+    def test_extraction_result_keeps_draft_file_ungrounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FileSystemExtractionOutputRepository(Path(directory))
+            repo.save_extraction_result(
+                workflow_id="pkg",
+                result=ExtractionRunResult(
+                    generated_final_draft={"id": "grounded"},
+                    generated_reconstructed_draft={"id": "draft"},
+                    machine_evidence_context=RoutedEvidenceContext(),
+                    draft_quality_state="imperfect_final_draft",
+                    validation=DraftValidationResult(status="valid"),
+                    chat_model="m",
+                ),
+            )
+
+            self.assertEqual(repo.load_generated_final_draft("pkg", chat_model="m"), {"id": "draft"})
+
+    def test_grounded_document_loads_and_stage_documents_are_cleared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FileSystemExtractionOutputRepository(Path(directory))
+            with self.assertRaises(FileNotFoundError):
+                repo.load_grounded_document("pkg", chat_model="m")
+            repo.save_grounding_artifacts(
+                workflow_id="pkg",
+                vocab_queries=[],
+                normalization=ExtractionNormalization(),
+                grounded_document={"id": "grounded"},
+                chat_model="m",
+            )
+            repo.save_curated_document(workflow_id="pkg", document={"id": "curated"}, chat_model="m")
+            for name in ("draft", "grounded", "curated"):
+                repo.save_document_exports(
+                    workflow_id="pkg", document_name=name, exports={"yaml": f"id: {name}\n"}, chat_model="m"
+                )
+            self.assertEqual(repo.load_grounded_document("pkg", chat_model="m"), {"id": "grounded"})
+
+            repo.clear_profile_stage_documents("pkg", chat_model="m")
+
+            export_dir = Path(directory) / "pkg" / "result" / "semantic" / "m" / "export"
+            self.assertEqual(sorted(path.name for path in export_dir.iterdir()), ["draft.yaml"])
+            with self.assertRaises(FileNotFoundError):
+                repo.load_grounded_document("pkg", chat_model="m")
+            with self.assertRaises(FileNotFoundError):
+                repo.load_curated_document("pkg", chat_model="m")
+            index = json.loads((Path(directory) / "pkg" / "artifact_index.json").read_text(encoding="utf-8"))
+            self.assertNotIn("result/semantic/m/export/grounded.yaml", {entry["path"] for entry in index["artifacts"]})
+
 
 class DocumentExportServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -452,31 +506,115 @@ class DocumentExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.repo.save_extraction_warnings(workflow_id="pkg", warnings=["file warning"])
         warnings = ["run warning"]
 
-        self.service._persist_state_artifacts("pkg", self._state(generated_reconstructed_draft=untitled), warnings=warnings)
+        self.service._persist_state_artifacts("pkg", self._state(curated_document=untitled), warnings=warnings)
 
         self.assertEqual(warnings[0], "run warning")
         self.assertEqual(len(warnings), 2)
-        self.assertTrue(warnings[1].startswith("SHACL validation of draft document"))
+        self.assertTrue(warnings[1].startswith("SHACL validation of curated document"))
         self.assertEqual(self.repo.load_extraction_warnings("pkg"), ["file warning"])
 
     def test_shacl_summary_warning_is_replaced_and_cleared(self):
         self.repo.save_extraction_warnings(workflow_id="pkg", warnings=["existing warning"])
         untitled = {key: value for key, value in DOCUMENT.items() if key != "title"}
 
-        self.service._persist_state_artifacts("pkg", self._state(generated_reconstructed_draft=untitled))
-        self.service._persist_state_artifacts("pkg", self._state(generated_reconstructed_draft=untitled))
+        self.service._persist_state_artifacts("pkg", self._state(curated_document=untitled))
+        self.service._persist_state_artifacts("pkg", self._state(curated_document=untitled))
         warnings = self.repo.load_extraction_warnings("pkg")
-        shacl_warnings = [warning for warning in warnings if warning.startswith("SHACL validation of draft document")]
+        shacl_warnings = [warning for warning in warnings if warning.startswith("SHACL validation of curated document")]
         self.assertEqual(warnings[0], "existing warning")
         self.assertEqual(len(shacl_warnings), 1)
         self.assertIn("test-profile 1.0.0: 1 violation(s)", shacl_warnings[0])
-        report = json.loads((self.export_dir / "draft.shacl.json").read_text(encoding="utf-8"))
+        report = json.loads((self.export_dir / "curated.shacl.json").read_text(encoding="utf-8"))
         self.assertFalse(report["conforms"])
 
-        self.service._persist_state_artifacts("pkg", self._state())
+        self.service._persist_state_artifacts("pkg", self._state(curated_document=DOCUMENT))
         self.assertEqual(self.repo.load_extraction_warnings("pkg"), ["existing warning"])
-        report = json.loads((self.export_dir / "draft.shacl.json").read_text(encoding="utf-8"))
+        report = json.loads((self.export_dir / "curated.shacl.json").read_text(encoding="utf-8"))
         self.assertTrue(report["conforms"])
+
+    def test_ungrounded_draft_gets_shacl_report_but_no_warning(self):
+        untitled = {key: value for key, value in DOCUMENT.items() if key != "title"}
+
+        self.service._persist_state_artifacts("pkg", self._state(generated_reconstructed_draft=untitled))
+
+        report = json.loads((self.export_dir / "draft.shacl.json").read_text(encoding="utf-8"))
+        self.assertFalse(report["conforms"])
+        self.assertEqual(self.repo.load_extraction_warnings("pkg"), [])
+
+    def test_grounded_document_is_exported_with_shacl_warning_and_survives_state_persistence(self):
+        grounded = {**DOCUMENT, "title": "Grounded"}
+        untitled_grounded = {key: value for key, value in grounded.items() if key != "title"}
+        state = self._state()
+
+        warnings, superseded = self.service._persist_document_exports(
+            "pkg", state, documents={"grounded": untitled_grounded}
+        )
+
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0].startswith("SHACL validation of grounded document"))
+        self.assertIn("SHACL validation of grounded document", superseded)
+        self.assertTrue((self.export_dir / "grounded.ttl").exists())
+        grounded_ttl = (self.export_dir / "grounded.ttl").read_text(encoding="utf-8")
+
+        # Persisting the run state (e.g. a curation action) exports the draft
+        # and curated documents only and leaves the grounded export alone.
+        self.service._persist_state_artifacts("pkg", self._state(curated_document=grounded))
+        self.assertEqual((self.export_dir / "grounded.ttl").read_text(encoding="utf-8"), grounded_ttl)
+        self.assertTrue((self.export_dir / "curated.ttl").exists())
+
+    def _save_grounded(self, document):
+        self.repo.save_grounding_artifacts(
+            workflow_id="pkg",
+            vocab_queries=[],
+            normalization=ExtractionNormalization(),
+            grounded_document=document,
+            chat_model="m",
+        )
+
+    async def test_document_export_auto_prefers_curated_then_grounded_then_draft(self):
+        state = self._state()
+        self.repo.save_extraction_run_state(workflow_id="pkg", state=state, chat_model="m")
+        self.service._persist_state_artifacts("pkg", state)
+
+        stage, content = await self.service.get_document_export(data_package_id="pkg", export_format="yaml", chat_model="m")
+        self.assertEqual(stage, "draft")
+        self.assertEqual(yaml.safe_load(content), DOCUMENT)
+
+        self._save_grounded({**DOCUMENT, "title": "Grounded"})
+        stage, content = await self.service.get_document_export(data_package_id="pkg", export_format="yaml", chat_model="m")
+        self.assertEqual((stage, yaml.safe_load(content)["title"]), ("grounded", "Grounded"))
+
+        self.repo.save_curated_document(workflow_id="pkg", document={**DOCUMENT, "title": "Curated"}, chat_model="m")
+        stage, content = await self.service.get_document_export(data_package_id="pkg", export_format="ttl", chat_model="m")
+        self.assertEqual(stage, "curated")
+        self.assertIn("Curated", content)
+
+        stage, content = await self.service.get_document_export(
+            data_package_id="pkg", export_format="yaml", stage="draft", chat_model="m"
+        )
+        self.assertEqual((stage, yaml.safe_load(content)), ("draft", DOCUMENT))
+        self.assertEqual(
+            await self.service.get_document_stages(data_package_id="pkg", chat_model="m"),
+            {"draft": True, "grounded": True, "curated": True},
+        )
+
+    async def test_requested_stage_must_exist(self):
+        state = self._state()
+        self.repo.save_extraction_run_state(workflow_id="pkg", state=state, chat_model="m")
+        self.service._persist_state_artifacts("pkg", state)
+
+        with self.assertRaises(ExtractionResultNotFoundError):
+            await self.service.get_document_export(
+                data_package_id="pkg", export_format="ttl", stage="grounded", chat_model="m"
+            )
+        self.assertEqual(
+            await self.service.get_document_stages(data_package_id="pkg", chat_model="m"),
+            {"draft": True, "grounded": False, "curated": False},
+        )
+        self.assertEqual(
+            await self.service.get_document_stages(data_package_id="unknown", chat_model="m"),
+            {"draft": False, "grounded": False, "curated": False},
+        )
 
     def test_missing_profile_is_reported_as_warning(self):
         self.service._persist_state_artifacts("pkg", self._state(profile_identifier="unknown-profile"))
@@ -484,24 +622,6 @@ class DocumentExportServiceTests(unittest.IsolatedAsyncioTestCase):
         warnings = self.repo.load_extraction_warnings("pkg")
         self.assertEqual(len(warnings), 1)
         self.assertIn("Export of draft document failed", warnings[0])
-
-    async def test_document_export_prefers_curated_document(self):
-        state = self._state()
-        self.repo.save_extraction_run_state(workflow_id="pkg", state=state, chat_model="m")
-        self.service._persist_state_artifacts("pkg", state)
-
-        name, content = await self.service.get_document_export(
-            data_package_id="pkg", export_format="yaml", chat_model="m"
-        )
-        self.assertEqual(name, "draft")
-        self.assertEqual(yaml.safe_load(content), DOCUMENT)
-
-        self.repo.save_curated_document(workflow_id="pkg", document={**DOCUMENT, "title": "Curated"}, chat_model="m")
-        name, content = await self.service.get_document_export(
-            data_package_id="pkg", export_format="ttl", chat_model="m"
-        )
-        self.assertEqual(name, "curated")
-        self.assertIn("Curated", content)
 
     async def test_document_export_errors(self):
         with self.assertRaises(ExtractionResultNotFoundError):
@@ -524,7 +644,12 @@ class FakeExportWorkflowService:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
-        return "curated", f"content as {kwargs['export_format']}"
+        stage = "curated" if kwargs["stage"] == "auto" else kwargs["stage"]
+        return stage, f"content as {kwargs['export_format']}"
+
+    async def get_document_stages(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"draft": True, "grounded": True, "curated": False}
 
 
 class DocumentExportApiTests(unittest.TestCase):
@@ -547,13 +672,35 @@ class DocumentExportApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.headers["content-type"], f"{media_type}; charset=utf-8")
             self.assertEqual(response.headers["content-disposition"], f'attachment; filename="{file_name}"')
+            self.assertEqual(response.headers["x-document-stage"], "curated")
             self.assertEqual(response.text, f"content as {export_format}")
         self.assertEqual(service.calls[-1], {
             "data_package_id": "pkg",
             "export_format": "shacl",
+            "stage": "auto",
             "chunking_strategy": "semantic",
             "chat_model": "m",
         })
+
+    def test_explicit_stage_is_passed_through_and_named_in_file(self):
+        service = FakeExportWorkflowService()
+        client = make_test_client(service)  # type: ignore[arg-type]
+
+        response = client.get("/api/v1/extraction/results/pkg/document", params={"format": "ttl", "stage": "grounded"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-document-stage"], "grounded")
+        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="pkg_grounded.ttl"')
+        self.assertEqual(service.calls[-1]["stage"], "grounded")
+        self.assertEqual(client.get("/api/v1/extraction/results/pkg/document?stage=final").status_code, 422)
+
+    def test_documents_endpoint_lists_available_stages(self):
+        client = make_test_client(FakeExportWorkflowService())  # type: ignore[arg-type]
+
+        response = client.get("/api/v1/extraction/results/pkg/documents", params={"chat_model": "m"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"draft": True, "grounded": True, "curated": False})
 
     def test_default_format_is_json_and_unknown_format_is_rejected(self):
         client = make_test_client(FakeExportWorkflowService())  # type: ignore[arg-type]

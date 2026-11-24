@@ -624,21 +624,37 @@ export async function getExtractionResult(data_package_id: string, chunking_stra
 }
 
 export type DocumentExportFormat = 'json' | 'yaml' | 'jsonld' | 'ttl' | 'shacl';
+/** draft = step-4 projection (not grounded), grounded = after vocabulary grounding, curated = user-curated. */
+export type DocumentStage = 'draft' | 'grounded' | 'curated';
+export type DocumentStageRequest = DocumentStage | 'auto';
 
-/** Downloads the curated document (or, if none was saved, the generated draft) in the given format. */
+/** Downloads a profile document in the given format; `auto` serves curated, then grounded, then draft. */
 export async function downloadExtractionDocument(
   data_package_id: string,
   format: DocumentExportFormat,
+  stage: DocumentStageRequest,
   chunking_strategy?: ChunkingStrategy,
   chat_model?: string | null,
-): Promise<{ blob: Blob; filename: string }> {
+): Promise<{ blob: Blob; filename: string; stage: DocumentStage | null }> {
   const response = await fetch(
-    apiBaseUrl + '/extraction/results/' + encodeURIComponent(data_package_id) + '/document' + buildQuery({ format, chunking_strategy, chat_model }),
+    apiBaseUrl + '/extraction/results/' + encodeURIComponent(data_package_id) + '/document' + buildQuery({ format, stage, chunking_strategy, chat_model }),
   );
   if (!response.ok) await readJson(response);
   const disposition = response.headers.get('content-disposition') ?? '';
   const filename = /filename="?([^";]+)"?/i.exec(disposition)?.[1] ?? `${data_package_id}.${format}`;
-  return { blob: await response.blob(), filename };
+  const servedStage = response.headers.get('x-document-stage') as DocumentStage | null;
+  return { blob: await response.blob(), filename, stage: servedStage };
+}
+
+/** Which stage documents exist for a branch. */
+export async function getDocumentStages(
+  data_package_id: string,
+  chunking_strategy?: ChunkingStrategy,
+  chat_model?: string | null,
+): Promise<Record<DocumentStage, boolean>> {
+  return readJson(await fetch(
+    apiBaseUrl + '/extraction/results/' + encodeURIComponent(data_package_id) + '/documents' + buildQuery({ chunking_strategy, chat_model }),
+  ));
 }
 
 export async function extractInitialContext(input: {

@@ -341,10 +341,16 @@ class FakeOutputRepository:
     def save_document_exports(self, *, workflow_id: str, document_name: str, exports: dict, **_kwargs):
         self.document_exports = {**getattr(self, "document_exports", {}), document_name: exports}
 
+    def clear_profile_stage_documents(self, workflow_id: str, chat_model: str | None = None, chunking_strategy: str = "semantic"):
+        self.cleared_stage_documents = [*getattr(self, "cleared_stage_documents", []), (workflow_id, chat_model, chunking_strategy)]
+
     def load_curated_document(self, workflow_id: str, chat_model: str | None = None, **_kwargs) -> dict:
         if self.curated_document is None:
             raise FileNotFoundError
         return self.curated_document
+
+    def load_grounded_document(self, workflow_id: str, chat_model: str | None = None, **_kwargs) -> dict:
+        raise FileNotFoundError
 
     def save_projection_ledger(self, *, workflow_id: str, ledger: list, chat_model: str | None = None, **_kwargs):
         self.projection_ledger = ledger
@@ -999,10 +1005,11 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_profile_projection_keeps_export_warnings_in_saved_and_live_warnings(self):
         # The task saves its local warning list right after persisting the
-        # exports; the SHACL summary must survive that save and reach the UI.
+        # exports; export warnings must survive that save and reach the progress.
+        # (The step-4 draft raises no SHACL summary, only export failures.)
         service, task_registry, output_repository = make_service([[make_chunk()]])
 
-        class NonConformingExportProfileService(FakeProfileService):
+        class FailingExportProfileService(FakeProfileService):
             def export_document_formats(self, *, identifier: str, document: dict):
                 report = ShaclValidationReport(
                     conforms=False,
@@ -1010,9 +1017,13 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     profile_identifier=identifier,
                     profile_version="9.9",
                 )
-                return ProfileDocumentExport(contents={"yaml": "id: generated\n"}, shacl_report=report)
+                return ProfileDocumentExport(
+                    contents={"yaml": "id: generated\n"},
+                    errors={"jsonld": "boom"},
+                    shacl_report=report,
+                )
 
-        service.profile_service = NonConformingExportProfileService()  # type: ignore[assignment]
+        service.profile_service = FailingExportProfileService()  # type: ignore[assignment]
         persisted_context = RoutedEvidenceContext.model_validate(
             evidence_context("e-1", "sample measured at 20 C")
         )
@@ -1065,13 +1076,11 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             chat_model="chat",
         )
 
-        expected = (
-            "SHACL validation of draft document against profile 9.9: 2 violation(s); "
-            "see draft.shacl.json in the export folder of this branch."
-        )
+        expected = "Export of draft document as jsonld failed: boom"
         self.assertIn(expected, output_repository.warnings)
         self.assertIsNotNone(progress)
         self.assertIn(expected, progress.warnings)  # type: ignore[union-attr]
+        self.assertFalse(any(warning.startswith("SHACL validation") for warning in output_repository.warnings))
         self.assertEqual(output_repository.document_exports["draft"]["yaml"], "id: generated\n")
 
     async def test_profile_projection_requires_persisted_evidence_context(self):
@@ -3796,6 +3805,8 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(output_repository.run_state.generated_final_draft)
         self.assertEqual(output_repository.run_state.generated_final_draft["id"], "package-id")
+        # Grounded/curated documents of the replaced draft are dropped.
+        self.assertEqual(output_repository.cleared_stage_documents, [("package-id", "chat", "semantic")])
         status, progress = await service.get_extraction_progress(data_package_id="package-id")
         self.assertEqual(status, TaskStatus.COMPLETED)
         self.assertIsNotNone(progress)

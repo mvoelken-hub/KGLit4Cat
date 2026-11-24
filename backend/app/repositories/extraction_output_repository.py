@@ -1,4 +1,4 @@
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from app.domain.extraction import (
     CurationLedgerRecord,
@@ -23,6 +23,7 @@ from app.domain.extraction import (
     RequirementReport,
     RoutedEvidenceContext,
 )
+from app.domain.profiles import DocumentStage
 
 
 class ExtractionOutputRepository(Protocol):
@@ -193,8 +194,22 @@ class ExtractionOutputRepository(Protocol):
         self,
         *,
         workflow_id: str,
-        document_name: Literal["draft", "curated"],
+        document_name: DocumentStage,
         exports: dict[str, str | None],
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> None: ...
+
+    def load_grounded_document(
+        self,
+        workflow_id: str,
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> dict[str, Any]: ...
+
+    def clear_profile_stage_documents(
+        self,
+        workflow_id: str,
         chat_model: str | None = None,
         chunking_strategy: str = "semantic",
     ) -> None: ...

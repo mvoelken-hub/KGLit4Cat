@@ -104,6 +104,11 @@ PARENT_ATTRIBUTE_SYSTEM_PROMPT = (
 )
 
 
+# Stages that form the exported knowledge graph; only these raise a SHACL
+# summary warning (the ungrounded draft is expected to violate shapes).
+SHACL_WARNING_STAGES: frozenset[str] = frozenset({"grounded", "curated"})
+
+
 class ProjectionService:
     async def _build_profile_document_by_patching(
         self,
@@ -6426,8 +6431,7 @@ class ProjectionService:
         export_warnings, superseded = self._persist_document_exports(
             data_package_id,
             state,
-            draft=clean_document,
-            curated=state.curated_document,
+            documents={"grounded": clean_document, "curated": state.curated_document},
             persist_warnings=False,
         )
         warnings = self._merge_export_warnings(warnings, export_warnings, superseded)
@@ -6922,11 +6926,13 @@ class ProjectionService:
             chat_model=chat_model,
             chunking_strategy=chunking_strategy,
         )
+        # The grounded document is exported only by the grounding stage
+        # (_save_profile_result); state.generated_reconstructed_draft is the
+        # ungrounded step-4 draft.
         export_warnings, superseded = self._persist_document_exports(
             data_package_id,
             state,
-            draft=state.generated_reconstructed_draft,
-            curated=state.curated_document,
+            documents={"draft": state.generated_reconstructed_draft, "curated": state.curated_document},
             persist_warnings=warnings is None,
         )
         if warnings is not None:
@@ -6937,23 +6943,25 @@ class ProjectionService:
         data_package_id: str,
         state: ExtractionRunState,
         *,
-        draft: dict[str, Any] | None,
-        curated: dict[str, Any] | None,
+        documents: dict[DocumentStage, dict[str, Any] | None],
         persist_warnings: bool = True,
     ) -> tuple[list[str], tuple[str, ...]]:
-        """Write YAML/JSON-LD/Turtle exports and the SHACL report next to the JSON documents.
+        """Write YAML/JSON-LD/Turtle exports and the SHACL report of each stage document.
 
-        Export failures never interrupt the workflow: they are logged and
-        returned as warnings. Returns the new warnings and the warning prefixes
-        they supersede (earlier SHACL summaries and export failures of each
-        exported document); by default both are merged into
-        ``extraction_warnings.json``.
+        ``documents`` maps a stage (``draft``, ``grounded``, ``curated``) to its
+        document; ``None`` entries are skipped. Export failures never interrupt
+        the workflow: they are logged and returned as warnings. A SHACL summary
+        warning is only raised for the knowledge-graph stages (grounded,
+        curated); the ungrounded draft only gets its report file. Returns the
+        new warnings and the warning prefixes they supersede (earlier SHACL
+        summaries and export failures of each exported document); by default
+        both are merged into ``extraction_warnings.json``.
         """
         if self.output_repository is None or not state.profile_identifier:
             return [], ()
         warnings: list[str] = []
         superseded: list[str] = []
-        for document_name, document in (("draft", draft), ("curated", curated)):
+        for document_name, document in documents.items():
             if document is None:
                 continue
             shacl_prefix = f"SHACL validation of {document_name} document"
@@ -6980,7 +6988,7 @@ class ProjectionService:
                         f"Export of {document_name} document as {export_format} failed: {message}"
                     )
             report = export.shacl_report
-            if report is not None and not report.conforms:
+            if report is not None and not report.conforms and document_name in SHACL_WARNING_STAGES:
                 warnings.append(
                     f"{shacl_prefix} against {report.profile_identifier} {report.profile_version}: "
                     f"{report.violation_count} violation(s); see {document_name}.shacl.json "

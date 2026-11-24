@@ -36,6 +36,7 @@ from app.domain.extraction import (
 from app.domain.profiles import (
     DocumentExportError,
     DocumentExportFormat,
+    DocumentStage,
     InvalidProfileIdentifierError,
     ProfileCompatibilityError,
     ProfileNotFoundError,
@@ -527,7 +528,7 @@ async def get_extraction_result(
     response_class=Response,
     responses={
         200: {
-            "description": "Curated document if saved, otherwise the generated draft.",
+            "description": "Profile document of the requested stage (auto: curated, then grounded, then draft).",
             "content": {media_type: {} for media_type, _ in DOCUMENT_EXPORT_MEDIA_TYPES.values()},
         }
     },
@@ -535,6 +536,10 @@ async def get_extraction_result(
 async def download_extraction_document(
     data_package_id: str,
     format: DocumentExportFormat = Query(default="json", description="Export format."),
+    stage: DocumentStage | Literal["auto"] = Query(
+        default="auto",
+        description="Document stage: draft (step 4, not grounded), grounded, curated, or auto (most advanced available).",
+    ),
     chunking_strategy: Literal["semantic", "fixed_tokens"] | None = None,
     chat_model: str | None = None,
     workflow_service: WorkflowService = Depends(get_workflow_service),
@@ -543,6 +548,7 @@ async def download_extraction_document(
         document_name, content = await workflow_service.get_document_export(
             data_package_id=data_package_id,
             export_format=format,
+            stage=stage,
             chunking_strategy=chunking_strategy,
             chat_model=chat_model,
         )
@@ -557,8 +563,24 @@ async def download_extraction_document(
         media_type=f"{media_type}; charset=utf-8",
         headers={
             "Content-Disposition": f'attachment; filename="{file_name}"',
-            "Access-Control-Expose-Headers": "Content-Disposition",
+            "X-Document-Stage": document_name,
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Document-Stage",
         },
+    )
+
+
+@router.get("/results/{data_package_id}/documents")
+async def get_extraction_document_stages(
+    data_package_id: str,
+    chunking_strategy: Literal["semantic", "fixed_tokens"] | None = None,
+    chat_model: str | None = None,
+    workflow_service: WorkflowService = Depends(get_workflow_service),
+) -> dict[DocumentStage, bool]:
+    """Which profile document stages (draft, grounded, curated) exist for a branch."""
+    return await workflow_service.get_document_stages(
+        data_package_id=data_package_id,
+        chunking_strategy=chunking_strategy,
+        chat_model=chat_model,
     )
 
 
