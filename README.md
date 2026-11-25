@@ -256,6 +256,8 @@ The profile document exists in three stages. Only the grounded and curated stage
 
 The draft exports are refreshed whenever the step-4 draft is saved, the grounded exports when grounding runs, and the curated exports when the curated document is saved. Rebuilding the step-4 draft removes the grounded and curated documents and their exports, because they were derived from the previous draft.
 
+Grounding types quantities, quantity kinds, and units with the QUDT classes `http://qudt.org/schema/qudt/Quantity`, `…/QuantityKind`, and `…/Unit`. Packages grounded before this was corrected (earlier versions used `https://`) keep the old IRIs until grounding is run again.
+
 Each stage is exported in these formats:
 
 - **YAML** has the same content as the JSON, in document order and with Unicode kept as-is.

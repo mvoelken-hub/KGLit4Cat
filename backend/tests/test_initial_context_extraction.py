@@ -2931,9 +2931,21 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(grounded["type"]["id"], "https://example.org/dataset")
         attribute = grounded["has_quantitative_attribute"][0]
-        self.assertEqual(attribute["rdf_type"]["id"], "https://qudt.org/schema/qudt/Quantity")
+        self.assertEqual(attribute["rdf_type"]["id"], "http://qudt.org/schema/qudt/Quantity")
         self.assertEqual(attribute["has_quantity_type"]["id"], "http://qudt.org/vocab/quantitykind/Temperature")
-        self.assertEqual(attribute["has_quantity_type"]["rdf_type"]["id"], "https://qudt.org/schema/qudt/QuantityKind")
+        self.assertEqual(attribute["has_quantity_type"]["rdf_type"]["id"], "http://qudt.org/schema/qudt/QuantityKind")
+
+    def test_qudt_class_iris_use_the_qudt_schema_namespace(self):
+        # The QUDT namespace is http://; an https variant yields a second, foreign rdf:type.
+        from app.domain.extraction import (
+            QUDT_QUANTITY_KIND_URI,
+            QUDT_QUANTITY_URI,
+            QUDT_SCHEMA_VOCAB,
+            QUDT_UNIT_URI,
+        )
+
+        for iri in (QUDT_QUANTITY_URI, QUDT_QUANTITY_KIND_URI, QUDT_UNIT_URI):
+            self.assertTrue(iri.startswith(QUDT_SCHEMA_VOCAB + "/"), iri)
 
     def test_grounded_profile_document_keeps_term_label_and_vocab_source_for_defined_term(self):
         schema = {
