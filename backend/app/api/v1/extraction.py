@@ -29,9 +29,11 @@ from app.domain.datasources import (
     MultipleDataPackageZipFilesError,
 )
 from app.domain.extraction import (
+    ChatModelUnavailableError,
     ChunkingRequiredError,
     ExtractionResultNotFoundError,
     ExtractionValidationError,
+    InitialContextFailedError,
 )
 from app.domain.profiles import (
     DocumentExportError,
@@ -74,7 +76,7 @@ def _raise_extraction_error(exc: Exception) -> None:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
-    if isinstance(exc, ChunkingRequiredError):
+    if isinstance(exc, (ChunkingRequiredError, InitialContextFailedError)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -82,6 +84,11 @@ def _raise_extraction_error(exc: Exception) -> None:
     if isinstance(exc, DocumentExportError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if isinstance(exc, ChatModelUnavailableError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
     if isinstance(exc, ExtractionValidationError):

@@ -34,6 +34,8 @@ class PromptAttemptDiagnostic(BaseModel):
     attempt_index: int
     attempt_kind: str
     model: str
+    # Effective chat thinking mode sent for this attempt (auto/on/off/low/medium/high).
+    think: str | None = None
     tokenizer_fallback: bool = False
     tokenizer_fallback_reason: str | None = None
     components: list[PromptComponentDiagnostic] = Field(default_factory=list)

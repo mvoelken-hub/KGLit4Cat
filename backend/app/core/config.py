@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     ollama_generation_temperature: float = Field(default=0.0, validation_alias="OLLAMA_GENERATION_TEMPERATURE")
     ollama_generation_seed: int = Field(default=42, validation_alias="OLLAMA_GENERATION_SEED")
     ollama_enforce_output_token_limit: bool = Field(default=True, validation_alias="OLLAMA_ENFORCE_OUTPUT_TOKEN_LIMIT")
+    # Chat "thinking" mode: auto (model default, no parameter sent), on, off, low, medium, high.
+    ollama_chat_think: str = Field(default="auto", validation_alias="OLLAMA_CHAT_THINK")
     extraction_vocab_query_concurrency: int = 4
     vocab_selection_llm_concurrency: int = 1
     vocab_selection_parallel_mode: str = "conservative"

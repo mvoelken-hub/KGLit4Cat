@@ -249,6 +249,7 @@ async def ollama_config_payload(settings: Settings, ollama_client: OllamaClientW
     generation_temperature = float(getattr(ollama_client, "generation_temperature", getattr(settings, "ollama_generation_temperature", 0.0)))
     generation_seed = int(getattr(ollama_client, "generation_seed", getattr(settings, "ollama_generation_seed", 42)))
     enforce_output_token_limit = bool(getattr(ollama_client, "enforce_output_token_limit", getattr(settings, "ollama_enforce_output_token_limit", True)))
+    chat_think = str(getattr(ollama_client, "chat_think_mode", getattr(settings, "ollama_chat_think", "auto")))
     chat_model = getattr(ollama_client, "chat_model", settings.ollama_chat_model)
     embedding_model = getattr(ollama_client, "embed_model", settings.ollama_embed_model)
     is_local = is_local_ollama(settings)
@@ -280,6 +281,7 @@ async def ollama_config_payload(settings: Settings, ollama_client: OllamaClientW
             "generation_temperature": generation_temperature,
             "generation_seed": generation_seed,
             "enforce_output_token_limit": enforce_output_token_limit,
+            "chat_think": chat_think,
             "resets_on_api_restart": True,
         },
         "models": available_models,
@@ -319,6 +321,8 @@ def apply_runtime_config(
         settings.ollama_generation_seed = updates["generation_seed"]
     if "enforce_output_token_limit" in updates:
         settings.ollama_enforce_output_token_limit = updates["enforce_output_token_limit"]
+    if "chat_think" in updates:
+        settings.ollama_chat_think = updates["chat_think"]
 
     ollama_client.update_runtime_config(
         chat_model=updates.get("chat_model"),
@@ -328,6 +332,7 @@ def apply_runtime_config(
         generation_temperature=updates.get("generation_temperature"),
         generation_seed=updates.get("generation_seed"),
         enforce_output_token_limit=updates.get("enforce_output_token_limit"),
+        chat_think_mode=updates.get("chat_think"),
     )
 
 

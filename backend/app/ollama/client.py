@@ -7,6 +7,15 @@ from app.core.logging import logger
 
 Embedding = list[float]
 
+
+def _validated_think_mode(value: str | None) -> str:
+    """Normalize and validate a chat thinking mode; raises ValueError when unknown."""
+    from app.ollama.completion import parse_think_mode
+
+    normalized = (value or "auto").strip().lower()
+    parse_think_mode(normalized)
+    return normalized
+
 class OllamaClientWrapper:
     def __init__(self, settings: Settings, logger: Logger):
 
@@ -31,6 +40,7 @@ class OllamaClientWrapper:
         self.generation_temperature = getattr(settings, "ollama_generation_temperature", 0.0)
         self.generation_seed = getattr(settings, "ollama_generation_seed", 42)
         self.enforce_output_token_limit = getattr(settings, "ollama_enforce_output_token_limit", True)
+        self.chat_think_mode = _validated_think_mode(getattr(settings, "ollama_chat_think", "auto"))
 
         self._base_url = settings.ollama_base_url
 
@@ -44,6 +54,7 @@ class OllamaClientWrapper:
         generation_temperature: float | None = None,
         generation_seed: int | None = None,
         enforce_output_token_limit: bool | None = None,
+        chat_think_mode: str | None = None,
     ) -> None:
         if chat_model is not None:
             self.chat_model = chat_model
@@ -59,6 +70,8 @@ class OllamaClientWrapper:
             self.generation_seed = generation_seed
         if enforce_output_token_limit is not None:
             self.enforce_output_token_limit = enforce_output_token_limit
+        if chat_think_mode is not None:
+            self.chat_think_mode = _validated_think_mode(chat_think_mode)
 
     async def stop_all_models(self) -> None:
         await self.stop_embedding_model()

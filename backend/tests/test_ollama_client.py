@@ -193,6 +193,38 @@ class OllamaClientWrapperAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.generation_temperature, 0.2)
         self.assertFalse(client.enforce_output_token_limit)
 
+    def test_chat_think_mode_defaults_to_auto_and_reads_settings(self):
+        self.assertEqual(
+            OllamaClientWrapper(FakeSettings(), getLogger(__name__)).chat_think_mode,  # type: ignore[arg-type]
+            "auto",
+        )
+
+        class OffThinkSettings(FakeSettings):
+            ollama_chat_think = "OFF"
+
+        client = OllamaClientWrapper(OffThinkSettings(), getLogger(__name__))  # type: ignore[arg-type]
+        self.assertEqual(client.chat_think_mode, "off")
+
+    def test_update_runtime_config_sets_and_validates_chat_think_mode(self):
+        client = OllamaClientWrapper(FakeSettings(), getLogger(__name__))  # type: ignore[arg-type]
+
+        client.update_runtime_config(chat_think_mode="low")
+        self.assertEqual(client.chat_think_mode, "low")
+
+        client.update_runtime_config(chat_model="other")
+        self.assertEqual(client.chat_think_mode, "low")
+
+        with self.assertRaises(ValueError):
+            client.update_runtime_config(chat_think_mode="sometimes")
+        self.assertEqual(client.chat_think_mode, "low")
+
+    def test_invalid_chat_think_setting_fails_at_startup(self):
+        class BadThinkSettings(FakeSettings):
+            ollama_chat_think = "sometimes"
+
+        with self.assertRaises(ValueError):
+            OllamaClientWrapper(BadThinkSettings(), getLogger(__name__))  # type: ignore[arg-type]
+
     async def test_change_embedding_model_returns_new_model_when_verification_succeeds(self):
         client, _, model_client, embedding_client, _ = self.make_client()
 

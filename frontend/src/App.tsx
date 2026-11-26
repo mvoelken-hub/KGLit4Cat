@@ -28,6 +28,7 @@ import {
   removeOllamaModel,
   runOllamaPerformanceTest,
   updateOllamaRuntimeConfig,
+  type ChatThinkMode,
   type LlmBudget,
   type OllamaConfig,
   type OllamaPerformanceTest,
@@ -1021,6 +1022,7 @@ export function App() {
     embedding_num_gpu: number;
     generation_temperature: number;
     enforce_output_token_limit: boolean;
+    chat_think: ChatThinkMode;
   }) {
     setBusy('ollama');
     try {

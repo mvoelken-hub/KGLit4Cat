@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { WorkflowTokenUsage } from '../api/extraction';
-import type { LlmBudget, OllamaConfig, OllamaPerformanceTest } from '../api/system';
+import type { ChatThinkMode, LlmBudget, OllamaConfig, OllamaPerformanceTest } from '../api/system';
 import { formatDuration, formatMemory, formatTokenCount } from '../lib/format';
 import { requestAverage } from './TokenUsageSummary';
 export function OllamaSettingsPanel({
@@ -29,6 +29,7 @@ export function OllamaSettingsPanel({
     embedding_num_gpu: number;
     generation_temperature: number;
     enforce_output_token_limit: boolean;
+    chat_think: ChatThinkMode;
   }) => void;
   onRefresh: () => void;
   onPullModel: (model: string) => Promise<void>;
@@ -50,6 +51,7 @@ export function OllamaSettingsPanel({
   const [embeddingNumGpu, setEmbeddingNumGpu] = useState(-1);
   const [generationTemperature, setGenerationTemperature] = useState(0);
   const [enforceOutputTokenLimit, setEnforceOutputTokenLimit] = useState(true);
+  const [chatThink, setChatThink] = useState<ChatThinkMode>('auto');
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [pullModelName, setPullModelName] = useState('');
   const [performanceTest, setPerformanceTest] = useState<OllamaPerformanceTest | null>(null);
@@ -64,6 +66,7 @@ export function OllamaSettingsPanel({
     setEmbeddingNumGpu(runtime.embedding_num_gpu);
     setGenerationTemperature(runtime.generation_temperature);
     setEnforceOutputTokenLimit(runtime.enforce_output_token_limit);
+    setChatThink(runtime.chat_think ?? 'auto');
   }, [runtime]);
 
   function submit(event: FormEvent) {
@@ -76,6 +79,7 @@ export function OllamaSettingsPanel({
       embedding_num_gpu: embeddingNumGpu,
       generation_temperature: Math.max(0, generationTemperature),
       enforce_output_token_limit: enforceOutputTokenLimit,
+      chat_think: chatThink,
     });
   }
 
@@ -256,6 +260,17 @@ export function OllamaSettingsPanel({
                 <label>
                   <span>Temperature</span>
                   <input type="number" min={0} max={2} step={0.1} value={generationTemperature} onChange={(event) => setGenerationTemperature(parseFloat(event.target.value) || 0)} disabled={!runtime || busy} />
+                </label>
+                <label title="auto sends no thinking parameter (model default). Use off if a model loops in structured output.">
+                  <span>Chat thinking</span>
+                  <select value={chatThink} onChange={(event) => setChatThink(event.target.value as ChatThinkMode)} disabled={!runtime || busy}>
+                    <option value="auto">Auto (model default)</option>
+                    <option value="off">Off</option>
+                    <option value="on">On</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
                 </label>
                 <label>
                   <span>Output cap</span>

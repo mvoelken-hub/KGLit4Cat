@@ -16,6 +16,36 @@ Each decision should include:
 
 ## Decisions
 
+### 2026-11-18: Extract PDF Text As Bounded Paragraph Lines
+
+Decision: PDF text extraction reads PyMuPDF text blocks in content-stream order (no positional sorting), joins the lines of each block with spaces, removes line-end hyphenation in code, drops short blocks whose letters-only text recurs on at least half of the pages (running headers, footers, page numbers), re-joins a block with the most recent earlier block of the same font size when that block ends without terminal punctuation and the new block starts with a lowercase word, and packs paragraphs longer than 400 characters at sentence ends. The output has one paragraph or sentence group per line and no page markers.
+
+Reason: Plain `page.get_text()` on a two-column journal review produced one word per line for justified text, 180 hyphenation breaks, and repeated headers on every page. The line-based quality gate then dropped 76 lines, mostly short in-sentence tokens such as chemical formulas, and chunk embeddings, evidence source-context windows, and orientation previews saw word fragments. With the new extraction the same paper yields 205 lines, one dropped reference fragment, no hyphen breaks, and no headers. The 400-character cap keeps evidence source-context windows and preview lines bounded and keeps semantic chunking active for paper-length documents. Positional sorting was rejected because it moved figure captions and headings ahead of the column text.
+
+Tradeoff: All rules are layout heuristics without a dictionary. A compound hyphenated at a line end keeps its hyphen only when the hyphenated form occurs inside a line elsewhere in the document or matches a word-shape rule (digits or a short capitalised fragment such as `CO2-`, `Ni-`; a continuation that is itself hyphenated); otherwise it is joined (`long-term` → `longterm`). A short block whose letters recur on half of the pages is removed even if it is body text. Uppercase continuations across columns (`illustrated in` / `Fig. 1 below`) stay on separate lines. Tables and equations remain flattened text.
+
+Revisit trigger: Revisit when publications from other publishers or layouts show wrong reading order, lost body text, or wrong joins, or when a layout-aware extractor (for example pymupdf4llm) becomes an acceptable dependency.
+
+### 2026-11-18: Make The Chat Thinking Mode Configurable, Default Auto
+
+Decision: `OLLAMA_CHAT_THINK` (`auto | on | off | low | medium | high`) sets the Ollama `think` parameter for every chat completion whose caller does not pass an explicit value (currently all callers). `auto` sends no parameter and keeps the model default, so earlier runs stay reproducible. It can be changed at runtime through the Ollama settings panel, `PATCH /api/v1/ollama-config/runtime`, or `simone models`. Every prompt-diagnostic attempt records the effective mode, and the thesis batch script stores it with the runtime metadata.
+
+Reason: Local `gemma4:26b` with the model-default thinking behavior degenerated into repetition loops under temperature 0 and schema-constrained output (dataset summary looped to the output cap; chunk evidence extraction failed at ~1650 tokens). The same prompts with `think=False` returned valid JSON immediately. Previously no setting could change this.
+
+Tradeoff: The right value is model-specific and must be set alongside `OLLAMA_CHAT_MODEL`. Runs with different thinking modes are not directly comparable, which is why the mode is recorded per attempt.
+
+Revisit trigger: Revisit when per-stage thinking budgets are needed (for example thinking only for semantic diagnosis) or when profile runs show that thinking improves quality enough to justify its token cost.
+
+### 2026-11-13: Fail Fast On An Unavailable Chat Model And On Failed File Understanding
+
+Decision: Initial file understanding, evidence extraction, and the complete workflow call a chat-model preflight (`verify_chat`) before scheduling their background task. Auth (401), quota (402), missing-model (404), and connection errors are raised immediately as `ChatModelUnavailableError` (HTTP 503) with an actionable hint; a slow first model load (timeout) does not block the stage. When initial file understanding ran but every text-extractable file summary failed, the summary status is `failed`, evidence extraction stops with `InitialContextFailedError` (HTTP 409) naming the first underlying error, and the failed state stays persisted. A failed overview with valid file summaries is non-fatal: evidence extraction keeps the summaries and continues without the overview. A rerun of initial file understanding no longer short-circuits on a previously failed run. The summary status now distinguishes `completed`, `partial`, and `failed`.
+
+Reason: A PDF-publication test run produced eight 401 summary failures that were recorded as warnings, reported the stage as completed, and then made the evidence stage discard the initial context and fail with the misleading message "Run initial file understanding before chunk extraction." The workflow could not tell an infrastructure failure from a missing step.
+
+Tradeoff: Stage starts now issue one extra chat request, and a first-time local model load can delay the start response by up to the preflight timeout.
+
+Revisit trigger: Revisit if the preflight request itself becomes a bottleneck, or if evidence extraction should optionally run without any file summaries.
+
 ### 2026-08-10: Develop PARSE4Cat In A Separate Repository
 
 Decision: Develop the installable, framework-independent workflow core as

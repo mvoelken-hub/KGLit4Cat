@@ -651,6 +651,7 @@ class BatchRunner:
             return {
                 "chat_model": runtime.get("chat_model"),
                 "generation_seed": runtime.get("generation_seed"),
+                "chat_think": runtime.get("chat_think"),
             }
         except Exception as exc:
             print(f"[WARN] Could not read current runtime config: {exc}", file=sys.stderr)
