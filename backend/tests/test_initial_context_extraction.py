@@ -12,6 +12,7 @@ from app.domain.extraction import (
     InitialFileSummaryProgress,
     chat_model_unavailable_message,
     DefinedTerm,
+    DraftValidationResult,
     EvidenceAssessment,
     EvidenceAssessmentContext,
     EvidenceContext,
@@ -19,8 +20,10 @@ from app.domain.extraction import (
     ExtractionChunkResult,
     ExtractionContext,
     ExtractionFileSummary,
+    InitialFileSummaryProgress,
     ExtractionOverview,
     ExtractionOverviewFilePreview,
+    ExtractionOverviewNode,
     ExtractionOverviewModelOutput,
     ExtractionNormalization,
     ExtractionRunResult,
@@ -56,6 +59,7 @@ from app.domain.extraction import (
     build_extraction_overview_prompt,
     build_extraction_overview_prompt_components,
 )
+from app.domain.profiles import ProfileDocumentExport, ShaclValidationReport
 from app.domain.semantics import CompactVocabResource, VocabGraphStatement, VocabQuery, VocabQueryResult, VocabSchemeInfo, VocabTermScheme
 from app.domain.extraction.evidence_context import validate_evidence_candidates
 from app.ollama.completion import CompletionResult
@@ -141,6 +145,9 @@ class FakeProfileService:
     def validate_document(self, *, identifier: str, document: dict):
         errors = [] if isinstance(document.get("id"), str) else [SimpleNamespace(path="$.id", message="required")]
         return SimpleNamespace(valid=not errors, errors=errors)
+
+    def export_document_formats(self, *, identifier: str, document: dict):
+        return ProfileDocumentExport()
 
 
 class TitleProfileService(FakeProfileService):
@@ -338,10 +345,19 @@ class FakeOutputRepository:
     def save_curated_document(self, *, workflow_id: str, document: dict, chat_model: str | None = None, **_kwargs):
         self.curated_document = document
 
+    def save_document_exports(self, *, workflow_id: str, document_name: str, exports: dict, **_kwargs):
+        self.document_exports = {**getattr(self, "document_exports", {}), document_name: exports}
+
+    def clear_profile_stage_documents(self, workflow_id: str, chat_model: str | None = None, chunking_strategy: str = "semantic"):
+        self.cleared_stage_documents = [*getattr(self, "cleared_stage_documents", []), (workflow_id, chat_model, chunking_strategy)]
+
     def load_curated_document(self, workflow_id: str, chat_model: str | None = None, **_kwargs) -> dict:
         if self.curated_document is None:
             raise FileNotFoundError
         return self.curated_document
+
+    def load_grounded_document(self, workflow_id: str, chat_model: str | None = None, **_kwargs) -> dict:
+        raise FileNotFoundError
 
     def save_projection_ledger(self, *, workflow_id: str, ledger: list, chat_model: str | None = None, **_kwargs):
         self.projection_ledger = ledger
@@ -994,6 +1010,200 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.generated_final_draft, {"id": "generated"})
         self.assertEqual(state.chunk_results[0].evidence_context.portable_evidence[0].candidate_id, "e-1")
 
+    async def test_profile_projection_keeps_export_warnings_in_saved_and_live_warnings(self):
+        # The task saves its local warning list right after persisting the
+        # exports; export warnings must survive that save and reach the progress.
+        # (The step-4 draft raises no SHACL summary, only export failures.)
+        service, task_registry, output_repository = make_service([[make_chunk()]])
+
+        class FailingExportProfileService(FakeProfileService):
+            def export_document_formats(self, *, identifier: str, document: dict):
+                report = ShaclValidationReport(
+                    conforms=False,
+                    violation_count=2,
+                    profile_identifier=identifier,
+                    profile_version="9.9",
+                )
+                return ProfileDocumentExport(
+                    contents={"yaml": "id: generated\n"},
+                    errors={"jsonld": "boom"},
+                    shacl_report=report,
+                )
+
+        service.profile_service = FailingExportProfileService()  # type: ignore[assignment]
+        persisted_context = RoutedEvidenceContext.model_validate(
+            evidence_context("e-1", "sample measured at 20 C")
+        )
+        output_repository.save_evidence_context(
+            workflow_id="package-id",
+            evidence_context=persisted_context,  # type: ignore[arg-type]  # fake repo is typed with EvidenceContext
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        output_repository.save_extraction_run_state(
+            workflow_id="package-id",
+            state=ExtractionRunState(
+                profile_identifier="profile",
+                chat_model="chat",
+                chunking_strategy="semantic",
+                ranked_files=[RankedFile(rank=1, file_path="README.md")],
+                chunk_results=[
+                    ExtractionChunkResult(
+                        chunk_index=0,
+                        file_path="README.md",
+                        start_idx=0,
+                        end_idx=1,
+                        status="completed",
+                        evidence_context=RoutedEvidenceContext(portable_evidence=persisted_context.portable_evidence),
+                    )
+                ],
+            ),
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+
+        async def fake_build(**kwargs):
+            kwargs["state"].generated_final_draft = {"id": "generated"}
+            kwargs["state"].generated_reconstructed_draft = {"id": "generated"}
+            kwargs["progress"].generated_final_draft = {"id": "generated"}
+            return {"id": "generated"}
+
+        service._build_profile_document_by_patching = fake_build  # type: ignore[method-assign]
+        await service.run_profile_projection(
+            data_package_id="package-id",
+            profile_identifier="profile",
+            resume=True,
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        await task_registry.wait_for_task("extraction:profile:package-id:semantic:chat", timeout=2)
+        _status, progress = await service.get_extraction_progress(
+            data_package_id="package-id",
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+
+        expected = "Export of draft document as jsonld failed: boom"
+        self.assertIn(expected, output_repository.warnings)
+        self.assertIsNotNone(progress)
+        self.assertIn(expected, progress.warnings)  # type: ignore[union-attr]
+        self.assertFalse(any(warning.startswith("SHACL validation") for warning in output_repository.warnings))
+        self.assertEqual(output_repository.document_exports["draft"]["yaml"], "id: generated\n")
+
+    async def test_profile_projection_keeps_invalid_draft_as_step4_draft(self):
+        # An invalid draft skips requirement enrichment, but it must still become
+        # the step-4 draft; otherwise export and grounding have no input.
+        service, task_registry, output_repository = make_service([[make_chunk()]])
+        persisted_context = RoutedEvidenceContext.model_validate(
+            evidence_context("e-1", "sample measured at 20 C")
+        )
+        output_repository.save_evidence_context(
+            workflow_id="package-id",
+            evidence_context=persisted_context,  # type: ignore[arg-type]  # fake repo is typed with EvidenceContext
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        output_repository.save_extraction_run_state(
+            workflow_id="package-id",
+            state=ExtractionRunState(
+                profile_identifier="profile",
+                chat_model="chat",
+                chunking_strategy="semantic",
+                ranked_files=[RankedFile(rank=1, file_path="README.md")],
+                chunk_results=[
+                    ExtractionChunkResult(
+                        chunk_index=0,
+                        file_path="README.md",
+                        start_idx=0,
+                        end_idx=1,
+                        status="completed",
+                        evidence_context=RoutedEvidenceContext(portable_evidence=persisted_context.portable_evidence),
+                    )
+                ],
+            ),
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        invalid_draft = {"description": ["Powder diffraction pattern."]}
+
+        async def fake_build(**kwargs):
+            kwargs["state"].generated_final_draft = invalid_draft
+            kwargs["state"].validation = DraftValidationResult(status="invalid")
+            return invalid_draft
+
+        async def fail_enrichment(**_kwargs):
+            raise AssertionError("requirement enrichment ran on an invalid draft")
+
+        service._build_profile_document_by_patching = fake_build  # type: ignore[method-assign]
+        service._enrich_draft_with_requirements = fail_enrichment  # type: ignore[method-assign]
+        await service.run_profile_projection(
+            data_package_id="package-id",
+            profile_identifier="profile",
+            resume=True,
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        await task_registry.wait_for_task("extraction:profile:package-id:semantic:chat", timeout=2)
+
+        state = output_repository.run_state
+        self.assertIsNotNone(state)
+        self.assertEqual(state.generated_reconstructed_draft, invalid_draft)  # type: ignore[union-attr]
+        self.assertIn("draft", output_repository.document_exports)
+        self.assertTrue(
+            any(warning.startswith("Requirement enrichment was skipped") for warning in output_repository.warnings)
+        )
+
+    async def test_failed_dataset_level_projection_uses_package_name_as_title(self):
+        # Single-file packages often yield no title-like evidence; a fallback
+        # draft without a title would fail validation and skip enrichment.
+        service, _task_registry, _output_repository = make_service([[make_chunk()]])
+        state = ExtractionRunState(
+            chat_model="chat",
+            profile_identifier="profile",
+            initial_extraction_overview=ExtractionOverview(
+                source_fingerprint="",
+                source_file_paths=["pxrd.csv"],
+                nodes=[
+                    ExtractionOverviewNode(node_id="package:root", label="pxrd", kind="package", summary="Package root."),
+                    ExtractionOverviewNode(
+                        node_id="file:pxrd.csv",
+                        label="pxrd.csv",
+                        kind="file",
+                        file_path="pxrd.csv",
+                        summary="Diffractogram.",
+                    ),
+                ],
+                edges=[],
+                uncertainties=[],
+            ),
+            initial_extraction_overview_status="structured",
+        )
+        warnings: list[str] = []
+
+        async def fake_summary(**_kwargs):
+            return "Powder X-ray diffraction pattern of one sample."
+
+        async def fail_projection(*_args, **_kwargs):
+            raise MaxRetriesExceeded(
+                last_error=OutputParsingError("bad json"),
+                failed_response='{"title": [',
+                usage=RunUsage(requests=1),
+            )
+
+        service._generate_initial_dataset_summary = fake_summary  # type: ignore[method-assign]
+        with patch("app.services.workflow_service.generate_structured", side_effect=fail_projection):
+            document, records = await service._build_overview_shallow_projection(
+                data_package_id="package-id",
+                validation_schema=FakeProfileService.schema,
+                state=state,
+                warnings=warnings,
+            )
+
+        self.assertEqual(document["title"], ["pxrd"])
+        self.assertEqual(document["description"], ["Powder X-ray diffraction pattern of one sample."])
+        self.assertEqual(records[0].status, "user_edit_required")
+        self.assertTrue(any(warning.startswith("Dataset-level projection failed") for warning in warnings))
+
     async def test_profile_projection_requires_persisted_evidence_context(self):
         service, task_registry, output_repository = make_service([[make_chunk()]])
         output_repository.save_extraction_run_state(
@@ -1162,6 +1372,93 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, TaskStatus.RUNNING)
         with self.assertRaises(ValueError):
             await task_registry.wait_for_task("extraction:evidence:package-id:semantic:chat", timeout=2)
+
+    async def test_rejected_evidence_start_keeps_persisted_orientation(self):
+        service, task_registry, output_repository = make_service([[make_chunk()]])
+        persisted = output_repository.run_state
+        assert persisted is not None
+        # The overview lists the ranked files in another order, so the evidence
+        # start treats the orientation as stale and rejects the run.
+        persisted.ranked_files = [
+            RankedFile(rank=1, file_path="README.md"),
+            RankedFile(rank=2, file_path="data.csv"),
+        ]
+        persisted.initial_file_summaries = [
+            ExtractionFileSummary(
+                file_path=file_path,
+                data_format="text",
+                explicit_purpose="",
+                information_summary=f"{file_path} is present.",
+            )
+            for file_path in ("README.md", "data.csv")
+        ]
+        persisted.initial_extraction_overview = overview_for_file(
+            source_fingerprint="overview",
+        ).model_copy(update={"source_file_paths": ["data.csv", "README.md"]})
+        before = persisted.model_copy(deep=True)
+
+        await service.run_extraction(
+            data_package_id="package-id",
+            profile_identifier="profile",
+        )
+        with self.assertRaisesRegex(ValueError, "Run initial file understanding"):
+            await task_registry.wait_for_task("extraction:evidence:package-id:semantic:chat", timeout=2)
+
+        after = output_repository.run_state
+        assert after is not None
+        self.assertEqual(after.ranked_files, before.ranked_files)
+        self.assertEqual(after.initial_file_summaries, before.initial_file_summaries)
+        self.assertEqual(after.initial_file_summary_status, "completed")
+        self.assertEqual(after.initial_extraction_overview, before.initial_extraction_overview)
+        self.assertEqual(after.initial_extraction_overview_status, "structured")
+
+    async def test_orientation_without_file_summaries_ranks_like_evidence_start(self):
+        service, _, _ = make_service([[make_chunk()]], with_initial_context=False)
+        data_package = DataPackage(
+            file_name="package",
+            files=[
+                FileEntry(
+                    file_path="NMR.jdx",
+                    file_name="NMR.jdx",
+                    file_extension=".jdx",
+                    raw_content=b"##TITLE= spectrum\n" * 10_000,
+                ),
+                FileEntry(
+                    file_path="NMR_copy_for_metadata_extraction.txt",
+                    file_name="NMR_copy_for_metadata_extraction.txt",
+                    file_extension=".txt",
+                    raw_content=b"metadata",
+                ),
+            ],
+        )
+
+        # All file summaries failed: orientation must still produce the ranking
+        # an evidence start computes, and order its overview files by it.
+        ranking = service._rank_files_from_summaries(
+            data_package=data_package,
+            state=ExtractionRunState(initial_file_summaries=[]),
+        )
+        evidence_ranking = await service._rank_files("package-id", data_package, [])
+        previews = service._initial_overview_file_previews(
+            data_package=data_package,
+            ranking=ranking,
+        )
+        overview = overview_for_file().model_copy(
+            update={"source_file_paths": [preview.file_path for preview in previews]}
+        )
+
+        self.assertEqual(
+            [file.file_path for file in ranking.files],
+            [file.file_path for file in evidence_ranking.files],
+        )
+        self.assertEqual(ranking.files[0].file_path, "NMR_copy_for_metadata_extraction.txt")
+        self.assertTrue(
+            service._initial_overview_matches_current_run(
+                overview=overview,
+                status="structured",
+                ranking=evidence_ranking,
+            )
+        )
 
     async def test_initial_overview_previews_use_ranked_top_files_and_raw_first_lines(self):
         service, _, _ = make_service([[make_chunk()]])
@@ -1456,6 +1753,31 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             '{"file_path": "title", "status": "failed"}',
         )
         self.assertEqual(failure.details["last_error_type"], "OutputParsingError")
+
+    def test_summary_match_accepts_recorded_failures_but_not_stale_or_new_files(self):
+        match = WorkflowService._initial_file_summaries_match_current_run
+        ranking = FileRankingResult(files=[
+            RankedFile(rank=1, file_path="a.txt"),
+            RankedFile(rank=2, file_path="b.csv"),
+        ])
+        summary_a = ExtractionFileSummary(file_path="a.txt", data_format="text", explicit_purpose="", information_summary="")
+
+        def progress(failed: int, skipped: int = 0) -> InitialFileSummaryProgress:
+            return InitialFileSummaryProgress(total_files=2, failed_files=failed, skipped_files=skipped)
+
+        # Every ranked file summarized.
+        both = [summary_a, ExtractionFileSummary(file_path="b.csv", data_format="table", explicit_purpose="", information_summary="")]
+        self.assertTrue(match(summaries=both, status="completed", ranking=ranking))
+        # One or all summaries failed: still the current run (was blocking evidence extraction).
+        self.assertTrue(match(summaries=[summary_a], status="partial", ranking=ranking, progress=progress(1)))
+        self.assertTrue(match(summaries=[], status="failed", ranking=ranking, progress=progress(2)))
+        self.assertTrue(match(summaries=[], status="completed", ranking=ranking, progress=progress(0, skipped=2)))
+        # Not the current run: no orientation, unknown counts, stale summary, or a new file.
+        self.assertFalse(match(summaries=[], status=None, ranking=ranking, progress=progress(2)))
+        self.assertFalse(match(summaries=[summary_a], status="partial", ranking=ranking))
+        stale = [ExtractionFileSummary(file_path="old.txt", data_format="text", explicit_purpose="", information_summary="")]
+        self.assertFalse(match(summaries=stale, status="partial", ranking=ranking, progress=progress(1)))
+        self.assertFalse(match(summaries=[], status="failed", ranking=ranking, progress=progress(1)))
 
     async def test_initial_overview_generation_stamps_file_provenance(self):
         service, _, output_repository = make_service([[make_chunk()]])
@@ -2842,9 +3164,21 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(grounded["type"]["id"], "https://example.org/dataset")
         attribute = grounded["has_quantitative_attribute"][0]
-        self.assertEqual(attribute["rdf_type"]["id"], "https://qudt.org/schema/qudt/Quantity")
+        self.assertEqual(attribute["rdf_type"]["id"], "http://qudt.org/schema/qudt/Quantity")
         self.assertEqual(attribute["has_quantity_type"]["id"], "http://qudt.org/vocab/quantitykind/Temperature")
-        self.assertEqual(attribute["has_quantity_type"]["rdf_type"]["id"], "https://qudt.org/schema/qudt/QuantityKind")
+        self.assertEqual(attribute["has_quantity_type"]["rdf_type"]["id"], "http://qudt.org/schema/qudt/QuantityKind")
+
+    def test_qudt_class_iris_use_the_qudt_schema_namespace(self):
+        # The QUDT namespace is http://; an https variant yields a second, foreign rdf:type.
+        from app.domain.extraction import (
+            QUDT_QUANTITY_KIND_URI,
+            QUDT_QUANTITY_URI,
+            QUDT_SCHEMA_VOCAB,
+            QUDT_UNIT_URI,
+        )
+
+        for iri in (QUDT_QUANTITY_URI, QUDT_QUANTITY_KIND_URI, QUDT_UNIT_URI):
+            self.assertTrue(iri.startswith(QUDT_SCHEMA_VOCAB + "/"), iri)
 
     def test_grounded_profile_document_keeps_term_label_and_vocab_source_for_defined_term(self):
         schema = {
@@ -3716,6 +4050,8 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(output_repository.run_state.generated_final_draft)
         self.assertEqual(output_repository.run_state.generated_final_draft["id"], "package-id")
+        # Grounded/curated documents of the replaced draft are dropped.
+        self.assertEqual(output_repository.cleared_stage_documents, [("package-id", "chat", "semantic")])
         status, progress = await service.get_extraction_progress(data_package_id="package-id")
         self.assertEqual(status, TaskStatus.COMPLETED)
         self.assertIsNotNone(progress)

@@ -11,9 +11,9 @@ from app.domain.semantics import VocabQuery
 QUDT_QUANTITY_KIND_VOCAB = "http://qudt.org/vocab/quantitykind"
 QUDT_UNIT_VOCAB = "http://qudt.org/vocab/unit"
 QUDT_SCHEMA_VOCAB = "http://qudt.org/schema/qudt"
-QUDT_QUANTITY_URI = "https://qudt.org/schema/qudt/Quantity"
-QUDT_QUANTITY_KIND_URI = "https://qudt.org/schema/qudt/QuantityKind"
-QUDT_UNIT_URI = "https://qudt.org/schema/qudt/Unit"
+QUDT_QUANTITY_URI = "http://qudt.org/schema/qudt/Quantity"
+QUDT_QUANTITY_KIND_URI = "http://qudt.org/schema/qudt/QuantityKind"
+QUDT_UNIT_URI = "http://qudt.org/schema/qudt/Unit"
 QUDT_QUANTITY_KIND_RDF_TYPE = "qudt__QuantityKind"
 QUDT_UNIT_RDF_TYPE = "qudt__Unit"
 DEFAULT_QUALITATIVE_VOCAB_IDENTIFIERS = [

@@ -43,10 +43,16 @@ class OrientationService:
             )
             for file in data_package.files
         }
-        return rank_summarized_files(
+        ranking = rank_summarized_files(
             state.initial_file_summaries,
             file_contexts=file_contexts,
         )
+        if ranking.files:
+            return ranking
+        # Without any file summary, rank like an evidence start does (_rank_files);
+        # an empty ranking would order the overview by inventory instead, so a
+        # later evidence start would not match it and reject the orientation.
+        return fallback_file_ranking(list(file_contexts.values()))
 
     async def _generate_initial_file_summaries(
         self,
@@ -2021,6 +2027,20 @@ class OrientationService:
         )
 
     @staticmethod
+    def _overview_package_name(state: ExtractionRunState) -> str | None:
+        overview = state.initial_extraction_overview
+        if overview is None:
+            return None
+        return next(
+            (
+                node.label.strip()
+                for node in overview.nodes
+                if node.kind == "package" and node.label.strip()
+            ),
+            None,
+        )
+
+    @staticmethod
     def _initial_overview_matches_current_run(
         *,
         overview: ExtractionOverview | None,
@@ -2047,17 +2067,29 @@ class OrientationService:
         summaries: list[ExtractionFileSummary],
         status: str | None,
         ranking: FileRankingResult,
+        progress: InitialFileSummaryProgress | None = None,
     ) -> bool:
-        if status is None or not summaries:
+        """Whether persisted file summaries belong to the current file ranking.
+
+        Failed or skipped files get no summary, so a completed orientation
+        may cover only part (or none) of the ranked files. That still counts
+        as the current run when the unsummarized files are exactly the ones
+        orientation recorded as failed or skipped; otherwise (unknown counts,
+        summaries for files no longer ranked, or new files) it does not.
+        """
+        if status is None:
             return False
         ranked_paths = {file.file_path for file in ranking.files}
         summary_paths = {
             summary.file_path
             for summary in summaries
         }
-        if summary_paths != ranked_paths:
+        if summaries and summary_paths == ranked_paths:
+            return True
+        if progress is None or not summary_paths <= ranked_paths:
             return False
-        return True
+        unsummarized = len(ranked_paths - summary_paths)
+        return unsummarized > 0 and unsummarized == progress.failed_files + progress.skipped_files
 
     async def _generate_initial_dataset_summary(
         self,
@@ -2148,10 +2180,13 @@ class OrientationService:
             ),
             None,
         )
+        # A fallback draft without a title fails profile validation, which
+        # skips requirement enrichment; the package name is the last resort.
+        fallback_title = skeleton_title or self._overview_package_name(state)
         fallback_document, fallback_records = shallow_projection_to_dcat_document(
             ShallowDatasetProjection.model_validate(skeleton),
             data_package_id=data_package_id,
-            fallback_title=skeleton_title,
+            fallback_title=fallback_title,
         )
         file_summaries = compact_file_summaries_for_shallow_projection(
             initial_file_summaries=state.initial_file_summaries,
@@ -2212,7 +2247,7 @@ class OrientationService:
             fallback_document_with_summary, fallback_records_with_summary = shallow_projection_to_dcat_document(
                 ShallowDatasetProjection.model_validate(skeleton),
                 data_package_id=data_package_id,
-                fallback_title=skeleton_title,
+                fallback_title=fallback_title,
                 fallback_description=dataset_summary,
             )
             return (
@@ -2258,7 +2293,7 @@ class OrientationService:
             fallback_document_with_summary, fallback_records_with_summary = shallow_projection_to_dcat_document(
                 ShallowDatasetProjection.model_validate(skeleton),
                 data_package_id=data_package_id,
-                fallback_title=skeleton_title,
+                fallback_title=fallback_title,
                 fallback_description=dataset_summary,
             )
             return (

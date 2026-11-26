@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { chunkDataPackage, deleteDataPackage, getChunkStatus, getDataPackageChunks, getFileEntryContent, listDataPackages, uploadDataPackage, type ChunkingStrategy } from './api/datasources';
 import {
   applyCurationFieldAction,
+  getDocumentStages,
   getExtractionResult,
   getInitialContextProgress,
   getWorkflowProgress,
@@ -17,6 +18,7 @@ import {
   runGroundingStage,
   saveCuratedDocument,
   updateVocabQueryConfig,
+  type DocumentStage,
 } from './api/extraction';
 import { deleteProfile, getProfileJsonSchema, listProfiles, registerProfile } from './api/profiles';
 import {
@@ -37,6 +39,7 @@ import { ChunkingStatusPanel, ChunkInspectionPanel, FileViewer } from './compone
 import { VocabularyPanel } from './components/VocabularyPanel';
 import { WorkflowBranchBar, StepPanel, type WorkflowBranch } from './components/WorkflowPanels';
 import { JsonDetails } from './components/JsonDetails';
+import { DocumentDownloadButtons } from './components/DocumentDownloadButtons';
 import { InitialFileUnderstandingPanel } from './components/InitialUnderstandingPanels';
 import { EvidenceContextOverview, evidenceContextNoteCount } from './components/EvidenceContextPanels';
 import { TokenUsageSummary } from './components/TokenUsageSummary';
@@ -364,6 +367,12 @@ export function App() {
   const saveCuratedDocumentTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const selectedPackageIdRef = useRef('');
   const workflowChatModel = ollamaConfig?.runtime.chat_model ?? null;
+  const [documentStages, setDocumentStages] = useState<Record<DocumentStage, boolean> | null>(null);
+  const knowledgeGraphStage: DocumentStage | null = documentStages?.curated
+    ? 'curated'
+    : documentStages?.grounded
+      ? 'grounded'
+      : null;
   const currentWorkflowBranch = useMemo(
     () => ({ strategy: chunkViewStrategy, chatModel: workflowChatModel }),
     [chunkViewStrategy, workflowChatModel],
@@ -1283,6 +1292,20 @@ export function App() {
     })();
   }, [selectedPackageId, chunkViewStrategy, workflowChatModel]);
 
+  // Which stage documents exist decides what the step-5 knowledge-graph download offers.
+  // Refreshed whenever the workflow progress or the curated document changes.
+  useEffect(() => {
+    if (!selectedPackageId) {
+      setDocumentStages(null);
+      return;
+    }
+    let cancelled = false;
+    getDocumentStages(selectedPackageId, chunkViewStrategy, workflowChatModel)
+      .then((stages) => { if (!cancelled) setDocumentStages(stages); })
+      .catch(() => { if (!cancelled) setDocumentStages(null); });
+    return () => { cancelled = true; };
+  }, [selectedPackageId, chunkViewStrategy, workflowChatModel, WorkflowProgress, patchStatus, curatedDocument]);
+
   useEffect(() => {
     if (!chunkResult || chunkResult.status === 'completed' || chunkResult.status === 'cancelled' || chunkResult.status === 'crashed') return;
     const interval = setInterval(() => void pollChunkProgress(), 3000);
@@ -1595,6 +1618,18 @@ export function App() {
                   <>
                     <button className="ghost" onClick={() => setCuratedEditorOpen(true)} disabled={!curatedDocument}>Edit</button>
                     <button className="ghost draft-recreate-button" onClick={() => void onGenerateDraft({ mode: 'rebuild' })} disabled={!selectedPackageId || !selectedProfile || !!busy || isPatching}>{busy === 'draft' ? 'Rebuilding...' : isProfileBuildRunning ? 'Rebuilding...' : 'Rebuild generated draft'}</button>
+                    {selectedPackageId && (
+                      <DocumentDownloadButtons
+                        dataPackageId={selectedPackageId}
+                        stage="draft"
+                        label="Draft (not grounded)"
+                        title="Step-4 draft before vocabulary grounding: values such as units are still free text. Use the knowledge-graph download in step 05 for the grounded document."
+                        chunkingStrategy={chunkViewStrategy}
+                        chatModel={workflowChatModel}
+                        disabled={isPatching}
+                        onError={setMessage}
+                      />
+                    )}
                   </>
                 )}
               </div>
@@ -1658,6 +1693,21 @@ export function App() {
                 </section>
               ) : (
                 <p className="muted">Build the generated profile before reviewing projection validation.</p>
+              )}
+              {hasProfileArtifacts && selectedPackageId && (
+                <div className="draft-actions">
+                  <DocumentDownloadButtons
+                    dataPackageId={selectedPackageId}
+                    stage={knowledgeGraphStage ?? 'auto'}
+                    label={knowledgeGraphStage ? `Knowledge graph (${knowledgeGraphStage})` : 'Knowledge graph'}
+                    title="Vocabulary-grounded document for the knowledge graph: the curated document if one was saved, otherwise the grounding result. The SHACL report validates its RDF graph against the registered profile's shapes."
+                    hint={knowledgeGraphStage ? null : 'Run grounding first.'}
+                    chunkingStrategy={chunkViewStrategy}
+                    chatModel={workflowChatModel}
+                    disabled={isPatching}
+                    onError={setMessage}
+                  />
+                </div>
               )}
               {hasProfileArtifacts && (
                 <DraftGroundingPanel

@@ -20,7 +20,7 @@ from app.domain.extraction import (
 
 from app.core.config import Settings
 from app.domain.extraction.workflow import ExtractionRunProgress, ExtractionRunState
-from app.domain.profiles import ProfileValidationResult
+from app.domain.profiles import ProfileDocumentExport, ProfileValidationResult
 from app.services.workflow_service import WorkflowService
 
 
@@ -289,6 +289,9 @@ class EvidenceNoveltyDecisionTests(unittest.TestCase):
 class FakeProfileService:
     def validate_document(self, *, identifier: str, document: dict) -> ProfileValidationResult:
         return ProfileValidationResult(valid=True, errors=[], warnings=[])
+
+    def export_document_formats(self, *, identifier: str, document: dict) -> ProfileDocumentExport:
+        return ProfileDocumentExport()
 
 
 def evidence_activity_schema() -> dict:

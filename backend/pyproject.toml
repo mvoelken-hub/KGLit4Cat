@@ -17,6 +17,7 @@ dependencies = [
     "pandas[excel]>=3.0.3",
     "pydantic>=2.13.4",
     "pymupdf>=1.27.2.3",
+    "pyshacl>=0.30.0",
     "pyyaml>=6.0.3",
     "rdflib>=7.6.0",
     "rdflib-neo4j>=1.1",

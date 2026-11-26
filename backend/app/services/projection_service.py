@@ -104,6 +104,11 @@ PARENT_ATTRIBUTE_SYSTEM_PROMPT = (
 )
 
 
+# Stages that form the exported knowledge graph; only these raise a SHACL
+# summary warning (the ungrounded draft is expected to violate shapes).
+SHACL_WARNING_STAGES: frozenset[str] = frozenset({"grounded", "curated"})
+
+
 class ProjectionService:
     async def _build_profile_document_by_patching(
         self,
@@ -180,6 +185,39 @@ class ProjectionService:
         self._save_run_state(data_package_id, state)
         self._persist_state_artifacts(data_package_id, state)
         self._update_progress(data_package_id, progress)
+        return document
+
+    async def _enrich_valid_profile_draft(
+        self,
+        *,
+        document: dict[str, Any],
+        data_package_id: str,
+        profile_identifier: str,
+        evidence_context: RoutedEvidenceContext,
+        validation_schema: dict[str, Any],
+        state: ExtractionRunState,
+        progress: ExtractionRunProgress,
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        if state.validation.status == "valid":
+            return await self._enrich_draft_with_requirements(
+                data_package_id=data_package_id,
+                profile_identifier=profile_identifier,
+                evidence_context=evidence_context,
+                validation_schema=validation_schema,
+                state=state,
+                progress=progress,
+                warnings=warnings,
+            )
+        # Requirement enrichment only patches a schema-valid draft. Keep the
+        # invalid draft as the step-4 draft so export and grounding still run.
+        if state.generated_reconstructed_draft is None:
+            state.generated_reconstructed_draft = self._clone_json_object(document)
+            progress.generated_reconstructed_draft = state.generated_reconstructed_draft
+        warnings.append(
+            "Requirement enrichment was skipped because the profile draft is not "
+            "schema-valid; the draft needs manual completion."
+        )
         return document
 
     async def _enrich_draft_with_requirements(
@@ -6422,6 +6460,14 @@ class ProjectionService:
             chunking_strategy=state.chunking_strategy,
             chat_model=state.chat_model,
         )
+        # Exports mirror the documents save_extraction_result writes below.
+        export_warnings, superseded = self._persist_document_exports(
+            data_package_id,
+            state,
+            documents={"grounded": clean_document, "curated": state.curated_document},
+            persist_warnings=False,
+        )
+        warnings = self._merge_export_warnings(warnings, export_warnings, superseded)
         result = ExtractionRunResult(
             generated_final_draft=clean_document,
             machine_evidence_context=evidence_context,
@@ -6819,7 +6865,15 @@ class ProjectionService:
         self,
         data_package_id: str,
         state: ExtractionRunState,
+        *,
+        warnings: list[str] | None = None,
     ) -> None:
+        """Persist the run state's artifacts, including document exports.
+
+        Pass ``warnings`` when the caller saves that list as
+        ``extraction_warnings.json`` afterwards: export warnings are then merged
+        into it in place instead of into the file, so they are not overwritten.
+        """
         if self.output_repository is None:
             return
         chat_model = state.chat_model
@@ -6905,6 +6959,111 @@ class ProjectionService:
             chat_model=chat_model,
             chunking_strategy=chunking_strategy,
         )
+        # The grounded document is exported only by the grounding stage
+        # (_save_profile_result); state.generated_reconstructed_draft is the
+        # ungrounded step-4 draft.
+        export_warnings, superseded = self._persist_document_exports(
+            data_package_id,
+            state,
+            documents={"draft": state.generated_reconstructed_draft, "curated": state.curated_document},
+            persist_warnings=warnings is None,
+        )
+        if warnings is not None:
+            warnings[:] = self._merge_export_warnings(warnings, export_warnings, superseded)
+
+    def _persist_document_exports(
+        self,
+        data_package_id: str,
+        state: ExtractionRunState,
+        *,
+        documents: dict[DocumentStage, dict[str, Any] | None],
+        persist_warnings: bool = True,
+    ) -> tuple[list[str], tuple[str, ...]]:
+        """Write YAML/JSON-LD/Turtle exports and the SHACL report of each stage document.
+
+        ``documents`` maps a stage (``draft``, ``grounded``, ``curated``) to its
+        document; ``None`` entries are skipped. Export failures never interrupt
+        the workflow: they are logged and returned as warnings. A SHACL summary
+        warning is only raised for the knowledge-graph stages (grounded,
+        curated); the ungrounded draft only gets its report file. Returns the
+        new warnings and the warning prefixes they supersede (earlier SHACL
+        summaries and export failures of each exported document); by default
+        both are merged into ``extraction_warnings.json``.
+        """
+        if self.output_repository is None or not state.profile_identifier:
+            return [], ()
+        warnings: list[str] = []
+        superseded: list[str] = []
+        for document_name, document in documents.items():
+            if document is None:
+                continue
+            shacl_prefix = f"SHACL validation of {document_name} document"
+            # Warnings about this document's exports always reflect the latest
+            # export: earlier SHACL summaries and failure messages are replaced.
+            superseded.extend(
+                (
+                    shacl_prefix,
+                    f"Export of {document_name} document",
+                    f"Writing {document_name} document exports",
+                )
+            )
+            try:
+                export = self.profile_service.export_document_formats(
+                    identifier=state.profile_identifier,
+                    document=document,
+                )
+            except Exception as exc:
+                warnings.append(f"Export of {document_name} document failed: {exc}")
+                continue
+            for export_format, message in export.errors.items():
+                if export_format != "json":
+                    warnings.append(
+                        f"Export of {document_name} document as {export_format} failed: {message}"
+                    )
+            report = export.shacl_report
+            if report is not None and not report.conforms and document_name in SHACL_WARNING_STAGES:
+                warnings.append(
+                    f"{shacl_prefix} against {report.profile_identifier} {report.profile_version}: "
+                    f"{report.violation_count} violation(s); see {document_name}.shacl.json "
+                    "in the export folder of this branch."
+                )
+            try:
+                self.output_repository.save_document_exports(
+                    workflow_id=data_package_id,
+                    document_name=document_name,
+                    exports={
+                        export_format: export.contents.get(export_format)
+                        for export_format in ("yaml", "jsonld", "ttl", "shacl")
+                    },
+                    chat_model=state.chat_model,
+                    chunking_strategy=state.chunking_strategy,
+                )
+            except Exception as exc:
+                warnings.append(f"Writing {document_name} document exports failed: {exc}")
+        for warning in warnings:
+            logger.warning("%s (workflow '%s')", warning, data_package_id)
+        if persist_warnings:
+            existing = self._load_warnings_or_empty(data_package_id)
+            merged = self._merge_export_warnings(existing, warnings, tuple(superseded))
+            if merged != existing:
+                self.output_repository.save_extraction_warnings(
+                    workflow_id=data_package_id,
+                    warnings=merged,
+                )
+        return warnings, tuple(superseded)
+
+    @staticmethod
+    def _merge_export_warnings(
+        existing: list[str],
+        new: list[str],
+        superseded_prefixes: tuple[str, ...],
+    ) -> list[str]:
+        kept = [
+            warning
+            for warning in existing
+            if not warning.startswith(superseded_prefixes) or warning in new
+        ]
+        return kept + [warning for warning in new if warning not in kept]
 
     def _clear_downstream_extraction_outputs(self, data_package_id: str) -> None:
         if self.output_repository is None:

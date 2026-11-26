@@ -1,8 +1,9 @@
 import json
+import re
 from io import BytesIO
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
 from app.core.task_registry import TaskStatus
 from app.api.v1.schemas import (
@@ -35,6 +36,9 @@ from app.domain.extraction import (
     InitialContextFailedError,
 )
 from app.domain.profiles import (
+    DocumentExportError,
+    DocumentExportFormat,
+    DocumentStage,
     InvalidProfileIdentifierError,
     ProfileCompatibilityError,
     ProfileNotFoundError,
@@ -46,6 +50,14 @@ from app.services.workflow_service import WorkflowService
 
 
 router = APIRouter(prefix="/extraction", tags=["Extraction"])
+
+DOCUMENT_EXPORT_MEDIA_TYPES: dict[str, tuple[str, str]] = {
+    "json": ("application/json", ".json"),
+    "yaml": ("application/yaml", ".yaml"),
+    "jsonld": ("application/ld+json", ".jsonld"),
+    "ttl": ("text/turtle", ".ttl"),
+    "shacl": ("application/json", ".shacl.json"),
+}
 
 
 def _raise_extraction_error(exc: Exception) -> None:
@@ -67,6 +79,11 @@ def _raise_extraction_error(exc: Exception) -> None:
     if isinstance(exc, (ChunkingRequiredError, InitialContextFailedError)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    if isinstance(exc, DocumentExportError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
     if isinstance(exc, ChatModelUnavailableError):
@@ -511,6 +528,67 @@ async def get_extraction_result(
         )
     except Exception as exc:
         _raise_extraction_error(exc)
+
+
+@router.get(
+    "/results/{data_package_id}/document",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Profile document of the requested stage (auto: curated, then grounded, then draft).",
+            "content": {media_type: {} for media_type, _ in DOCUMENT_EXPORT_MEDIA_TYPES.values()},
+        }
+    },
+)
+async def download_extraction_document(
+    data_package_id: str,
+    format: DocumentExportFormat = Query(default="json", description="Export format."),
+    stage: DocumentStage | Literal["auto"] = Query(
+        default="auto",
+        description="Document stage: draft (step 4, not grounded), grounded, curated, or auto (most advanced available).",
+    ),
+    chunking_strategy: Literal["semantic", "fixed_tokens"] | None = None,
+    chat_model: str | None = None,
+    workflow_service: WorkflowService = Depends(get_workflow_service),
+) -> Response:
+    try:
+        document_name, content = await workflow_service.get_document_export(
+            data_package_id=data_package_id,
+            export_format=format,
+            stage=stage,
+            chunking_strategy=chunking_strategy,
+            chat_model=chat_model,
+        )
+    except Exception as exc:
+        _raise_extraction_error(exc)
+        raise
+    media_type, extension = DOCUMENT_EXPORT_MEDIA_TYPES[format]
+    safe_package_id = re.sub(r"[^A-Za-z0-9._-]", "_", data_package_id)
+    file_name = f"{safe_package_id}_{document_name}{extension}"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type=f"{media_type}; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "X-Document-Stage": document_name,
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Document-Stage",
+        },
+    )
+
+
+@router.get("/results/{data_package_id}/documents")
+async def get_extraction_document_stages(
+    data_package_id: str,
+    chunking_strategy: Literal["semantic", "fixed_tokens"] | None = None,
+    chat_model: str | None = None,
+    workflow_service: WorkflowService = Depends(get_workflow_service),
+) -> dict[DocumentStage, bool]:
+    """Which profile document stages (draft, grounded, curated) exist for a branch."""
+    return await workflow_service.get_document_stages(
+        data_package_id=data_package_id,
+        chunking_strategy=chunking_strategy,
+        chat_model=chat_model,
+    )
 
 
 @router.get("/workflows/{data_package_id}/token-usage")

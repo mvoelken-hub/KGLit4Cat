@@ -23,6 +23,7 @@ from app.domain.extraction import (
     RequirementReport,
     RoutedEvidenceContext,
 )
+from app.domain.profiles import DocumentStage
 
 
 class ExtractionOutputRepository(Protocol):
@@ -185,6 +186,30 @@ class ExtractionOutputRepository(Protocol):
         *,
         workflow_id: str,
         document: dict[str, Any],
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> None: ...
+
+    def save_document_exports(
+        self,
+        *,
+        workflow_id: str,
+        document_name: DocumentStage,
+        exports: dict[str, str | None],
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> None: ...
+
+    def load_grounded_document(
+        self,
+        workflow_id: str,
+        chat_model: str | None = None,
+        chunking_strategy: str = "semantic",
+    ) -> dict[str, Any]: ...
+
+    def clear_profile_stage_documents(
+        self,
+        workflow_id: str,
         chat_model: str | None = None,
         chunking_strategy: str = "semantic",
     ) -> None: ...

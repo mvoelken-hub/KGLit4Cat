@@ -44,7 +44,7 @@ from app.domain.extraction import (
     stable_evidence_id,
 )
 from app.domain.extraction.workflow import ExtractionRunProgress, ExtractionRunState
-from app.domain.profiles import ProfileValidationIssue, ProfileValidationResult
+from app.domain.profiles import ProfileDocumentExport, ProfileValidationIssue, ProfileValidationResult
 from app.ollama.errors import CompletionError
 from app.services.projection_service import (
     _CoreObjectIntent,
@@ -704,6 +704,9 @@ class RequirementEvidencePacketTests(unittest.TestCase):
 class FakeProfileService:
     def validate_document(self, *, identifier: str, document: dict) -> ProfileValidationResult:
         return ProfileValidationResult(valid=True, errors=[])
+
+    def export_document_formats(self, *, identifier: str, document: dict) -> ProfileDocumentExport:
+        return ProfileDocumentExport()
 
 
 def quantitative_schema(*owner_classes: str) -> dict:

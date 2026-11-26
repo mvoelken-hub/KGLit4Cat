@@ -16,6 +16,7 @@ SOURCE_SCHEMA_FILE = "source_schema.yaml"
 MERGED_SCHEMA_FILE = "merged_schema.yaml"
 JSON_SCHEMA_FILE = "json_schema.json"
 JSONLD_CONTEXT_FILE = "jsonld_context.json"
+SHACL_SHAPES_FILE = "shacl_shapes.ttl"
 
 
 class FileSystemProfileRepository:
@@ -30,6 +31,8 @@ class FileSystemProfileRepository:
         self._write_text(profile_dir / MERGED_SCHEMA_FILE, artifacts.merged_schema)
         self._write_json(profile_dir / JSON_SCHEMA_FILE, artifacts.json_schema)
         self._write_json(profile_dir / JSONLD_CONTEXT_FILE, artifacts.jsonld_context)
+        if artifacts.shacl_shapes is not None:
+            self._write_text(profile_dir / SHACL_SHAPES_FILE, artifacts.shacl_shapes)
         self._write_json(
             profile_dir / PROFILE_MANIFEST_FILE,
             artifacts.manifest.model_dump(mode="json"),
@@ -69,6 +72,14 @@ class FileSystemProfileRepository:
 
     def load_jsonld_context(self, identifier: str) -> dict[str, Any]:
         return self._read_required_json(identifier, JSONLD_CONTEXT_FILE)
+
+    def load_shacl_shapes(self, identifier: str) -> str | None:
+        """SHACL shapes (Turtle), or None for profiles registered before shapes were stored."""
+        path = self._profile_dir(identifier) / SHACL_SHAPES_FILE
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def save_shacl_shapes(self, identifier: str, shapes: str) -> None:
+        self._write_text(self._profile_dir(identifier) / SHACL_SHAPES_FILE, shapes)
 
     def _read_required_text(self, identifier: str, file_name: str) -> str:
         path = self._profile_dir(identifier) / file_name
