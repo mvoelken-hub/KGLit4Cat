@@ -187,6 +187,39 @@ class ProjectionService:
         self._update_progress(data_package_id, progress)
         return document
 
+    async def _enrich_valid_profile_draft(
+        self,
+        *,
+        document: dict[str, Any],
+        data_package_id: str,
+        profile_identifier: str,
+        evidence_context: RoutedEvidenceContext,
+        validation_schema: dict[str, Any],
+        state: ExtractionRunState,
+        progress: ExtractionRunProgress,
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        if state.validation.status == "valid":
+            return await self._enrich_draft_with_requirements(
+                data_package_id=data_package_id,
+                profile_identifier=profile_identifier,
+                evidence_context=evidence_context,
+                validation_schema=validation_schema,
+                state=state,
+                progress=progress,
+                warnings=warnings,
+            )
+        # Requirement enrichment only patches a schema-valid draft. Keep the
+        # invalid draft as the step-4 draft so export and grounding still run.
+        if state.generated_reconstructed_draft is None:
+            state.generated_reconstructed_draft = self._clone_json_object(document)
+            progress.generated_reconstructed_draft = state.generated_reconstructed_draft
+        warnings.append(
+            "Requirement enrichment was skipped because the profile draft is not "
+            "schema-valid; the draft needs manual completion."
+        )
+        return document
+
     async def _enrich_draft_with_requirements(
         self,
         *,

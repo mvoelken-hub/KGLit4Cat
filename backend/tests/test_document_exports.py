@@ -299,6 +299,38 @@ class SchemaAwareExportTests(unittest.TestCase):
 
         self.assertIn("<urn:simone:document/genid/document>", export.contents["ttl"])
 
+    def test_ids_with_whitespace_are_percent_encoded_instead_of_dropped(self):
+        # rdflib drops a node whose id contains a space, and for the root node
+        # everything nested in it, which once exported an empty graph.
+        document = {
+            "id": "pkg dataset",
+            "title": "Dataset",
+            "was_generated_by": [{"id": "pkg activity", "title": "Generation"}, {"title": "Unnamed"}],
+        }
+
+        export = self._export(document)
+
+        graph = Graph().parse(data=export.contents["ttl"], format="turtle")
+        dataset = URIRef("urn:simone:document/pkg%20dataset")
+        activity = URIRef("urn:simone:document/pkg%20activity")
+        unnamed = URIRef("urn:simone:document/genid/pkg%20dataset/was_generated_by/1")
+        self.assertIn((dataset, PROV.wasGeneratedBy, activity), graph)
+        self.assertIn((activity, RDF.type, PROV.Activity), graph)
+        self.assertIn((dataset, PROV.wasGeneratedBy, unnamed), graph)
+        self.assertTrue(graph.isomorphic(Graph().parse(data=export.contents["jsonld"], format="json-ld")))
+        # JSON and YAML keep the document as generated.
+        self.assertEqual(json.loads(export.contents["json"])["id"], "pkg dataset")
+
+    def test_graph_dropped_by_rdflib_is_an_export_error_not_a_conforming_report(self):
+        with patch("app.domain.profiles.encode_iri_unsafe_ids", side_effect=lambda *, document, id_keys: document):
+            export = self._export({"id": "pkg dataset", "title": "Dataset"})
+
+        self.assertIn("produced no RDF triples", export.errors["jsonld"])
+        self.assertIn("produced no RDF triples", export.errors["ttl"])
+        self.assertIn("produced no RDF triples", export.errors["shacl"])
+        self.assertIsNone(export.shacl_report)
+        self.assertEqual(set(export.contents), {"json", "yaml"})
+
     def test_broken_shapes_only_cost_the_shacl_report(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = FileSystemProfileRepository(Path(directory))

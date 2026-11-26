@@ -8,6 +8,7 @@ from app.domain.datasources import ContentChunk, DataPackage, FileEntry
 from app.domain.extraction import (
     ChunkingRequiredError,
     DefinedTerm,
+    DraftValidationResult,
     EvidenceAssessment,
     EvidenceAssessmentContext,
     EvidenceContext,
@@ -15,8 +16,10 @@ from app.domain.extraction import (
     ExtractionChunkResult,
     ExtractionContext,
     ExtractionFileSummary,
+    InitialFileSummaryProgress,
     ExtractionOverview,
     ExtractionOverviewFilePreview,
+    ExtractionOverviewNode,
     ExtractionOverviewModelOutput,
     ExtractionNormalization,
     ExtractionRunResult,
@@ -1083,6 +1086,120 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(warning.startswith("SHACL validation") for warning in output_repository.warnings))
         self.assertEqual(output_repository.document_exports["draft"]["yaml"], "id: generated\n")
 
+    async def test_profile_projection_keeps_invalid_draft_as_step4_draft(self):
+        # An invalid draft skips requirement enrichment, but it must still become
+        # the step-4 draft; otherwise export and grounding have no input.
+        service, task_registry, output_repository = make_service([[make_chunk()]])
+        persisted_context = RoutedEvidenceContext.model_validate(
+            evidence_context("e-1", "sample measured at 20 C")
+        )
+        output_repository.save_evidence_context(
+            workflow_id="package-id",
+            evidence_context=persisted_context,  # type: ignore[arg-type]  # fake repo is typed with EvidenceContext
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        output_repository.save_extraction_run_state(
+            workflow_id="package-id",
+            state=ExtractionRunState(
+                profile_identifier="profile",
+                chat_model="chat",
+                chunking_strategy="semantic",
+                ranked_files=[RankedFile(rank=1, file_path="README.md")],
+                chunk_results=[
+                    ExtractionChunkResult(
+                        chunk_index=0,
+                        file_path="README.md",
+                        start_idx=0,
+                        end_idx=1,
+                        status="completed",
+                        evidence_context=RoutedEvidenceContext(portable_evidence=persisted_context.portable_evidence),
+                    )
+                ],
+            ),
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        invalid_draft = {"description": ["Powder diffraction pattern."]}
+
+        async def fake_build(**kwargs):
+            kwargs["state"].generated_final_draft = invalid_draft
+            kwargs["state"].validation = DraftValidationResult(status="invalid")
+            return invalid_draft
+
+        async def fail_enrichment(**_kwargs):
+            raise AssertionError("requirement enrichment ran on an invalid draft")
+
+        service._build_profile_document_by_patching = fake_build  # type: ignore[method-assign]
+        service._enrich_draft_with_requirements = fail_enrichment  # type: ignore[method-assign]
+        await service.run_profile_projection(
+            data_package_id="package-id",
+            profile_identifier="profile",
+            resume=True,
+            chunking_strategy="semantic",
+            chat_model="chat",
+        )
+        await task_registry.wait_for_task("extraction:profile:package-id:semantic:chat", timeout=2)
+
+        state = output_repository.run_state
+        self.assertIsNotNone(state)
+        self.assertEqual(state.generated_reconstructed_draft, invalid_draft)  # type: ignore[union-attr]
+        self.assertIn("draft", output_repository.document_exports)
+        self.assertTrue(
+            any(warning.startswith("Requirement enrichment was skipped") for warning in output_repository.warnings)
+        )
+
+    async def test_failed_dataset_level_projection_uses_package_name_as_title(self):
+        # Single-file packages often yield no title-like evidence; a fallback
+        # draft without a title would fail validation and skip enrichment.
+        service, _task_registry, _output_repository = make_service([[make_chunk()]])
+        state = ExtractionRunState(
+            chat_model="chat",
+            profile_identifier="profile",
+            initial_extraction_overview=ExtractionOverview(
+                source_fingerprint="",
+                source_file_paths=["pxrd.csv"],
+                nodes=[
+                    ExtractionOverviewNode(node_id="package:root", label="pxrd", kind="package", summary="Package root."),
+                    ExtractionOverviewNode(
+                        node_id="file:pxrd.csv",
+                        label="pxrd.csv",
+                        kind="file",
+                        file_path="pxrd.csv",
+                        summary="Diffractogram.",
+                    ),
+                ],
+                edges=[],
+                uncertainties=[],
+            ),
+            initial_extraction_overview_status="structured",
+        )
+        warnings: list[str] = []
+
+        async def fake_summary(**_kwargs):
+            return "Powder X-ray diffraction pattern of one sample."
+
+        async def fail_projection(*_args, **_kwargs):
+            raise MaxRetriesExceeded(
+                last_error=OutputParsingError("bad json"),
+                failed_response='{"title": [',
+                usage=RunUsage(requests=1),
+            )
+
+        service._generate_initial_dataset_summary = fake_summary  # type: ignore[method-assign]
+        with patch("app.services.workflow_service.generate_structured", side_effect=fail_projection):
+            document, records = await service._build_overview_shallow_projection(
+                data_package_id="package-id",
+                validation_schema=FakeProfileService.schema,
+                state=state,
+                warnings=warnings,
+            )
+
+        self.assertEqual(document["title"], ["pxrd"])
+        self.assertEqual(document["description"], ["Powder X-ray diffraction pattern of one sample."])
+        self.assertEqual(records[0].status, "user_edit_required")
+        self.assertTrue(any(warning.startswith("Dataset-level projection failed") for warning in warnings))
+
     async def test_profile_projection_requires_persisted_evidence_context(self):
         service, task_registry, output_repository = make_service([[make_chunk()]])
         output_repository.save_extraction_run_state(
@@ -1545,6 +1662,31 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
             '{"file_path": "title", "status": "failed"}',
         )
         self.assertEqual(failure.details["last_error_type"], "OutputParsingError")
+
+    def test_summary_match_accepts_recorded_failures_but_not_stale_or_new_files(self):
+        match = WorkflowService._initial_file_summaries_match_current_run
+        ranking = FileRankingResult(files=[
+            RankedFile(rank=1, file_path="a.txt"),
+            RankedFile(rank=2, file_path="b.csv"),
+        ])
+        summary_a = ExtractionFileSummary(file_path="a.txt", data_format="text", explicit_purpose="", information_summary="")
+
+        def progress(failed: int, skipped: int = 0) -> InitialFileSummaryProgress:
+            return InitialFileSummaryProgress(total_files=2, failed_files=failed, skipped_files=skipped)
+
+        # Every ranked file summarized.
+        both = [summary_a, ExtractionFileSummary(file_path="b.csv", data_format="table", explicit_purpose="", information_summary="")]
+        self.assertTrue(match(summaries=both, status="completed", ranking=ranking))
+        # One or all summaries failed: still the current run (was blocking evidence extraction).
+        self.assertTrue(match(summaries=[summary_a], status="partial", ranking=ranking, progress=progress(1)))
+        self.assertTrue(match(summaries=[], status="failed", ranking=ranking, progress=progress(2)))
+        self.assertTrue(match(summaries=[], status="completed", ranking=ranking, progress=progress(0, skipped=2)))
+        # Not the current run: no orientation, unknown counts, stale summary, or a new file.
+        self.assertFalse(match(summaries=[], status=None, ranking=ranking, progress=progress(2)))
+        self.assertFalse(match(summaries=[summary_a], status="partial", ranking=ranking))
+        stale = [ExtractionFileSummary(file_path="old.txt", data_format="text", explicit_purpose="", information_summary="")]
+        self.assertFalse(match(summaries=stale, status="partial", ranking=ranking, progress=progress(1)))
+        self.assertFalse(match(summaries=[], status="failed", ranking=ranking, progress=progress(1)))
 
     async def test_initial_overview_generation_stamps_file_provenance(self):
         service, _, output_repository = make_service([[make_chunk()]])

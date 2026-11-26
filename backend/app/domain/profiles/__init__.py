@@ -28,6 +28,8 @@ JSONLD_DOCUMENT_BASE_IRI = "urn:simone:document/"
 # "<package>:activity:<slug>" would otherwise be read as an IRI with the
 # package id as scheme; those are rebased onto JSONLD_DOCUMENT_BASE_IRI.
 GLOBAL_IRI_SCHEMES = frozenset({"http", "https", "urn", "mailto", "doi", "info", "tag", "ftp", "did"})
+# Characters rdflib rejects in IRIs (besides whitespace and control characters).
+IRI_UNSAFE_CHARACTERS = frozenset('<>"{}|\\^`')
 DEFAULT_ENRICHABLE_FIELD_CANDIDATES = frozenset(
     {"type", "has_quantity_type", "unit"}
 )
@@ -400,10 +402,16 @@ def export_document_to_jsonld(
         )
 
     context_body = jsonld_context.get("@context", jsonld_context)
-    clean_document = assign_positional_ids(
-        document=clean_document,
-        id_keys=_id_keys(context_body),
-        base_iri=JSONLD_DOCUMENT_BASE_IRI,
+    id_keys = _id_keys(context_body)
+    # Positional ids are percent-encoded already; encoding afterwards keeps the
+    # root id and the genid prefix derived from it consistent.
+    clean_document = encode_iri_unsafe_ids(
+        document=assign_positional_ids(
+            document=clean_document,
+            id_keys=id_keys,
+            base_iri=JSONLD_DOCUMENT_BASE_IRI,
+        ),
+        id_keys=id_keys,
     )
     jsonld_document = {
         **clean_document,
@@ -425,6 +433,10 @@ def export_document_to_jsonld(
     # @list containers) are skolemized to keep JSON-LD and Turtle identical.
     parsed = _rebase_local_iris(parsed, JSONLD_DOCUMENT_BASE_IRI)
     graph = parsed.skolemize(new_graph=Graph(namespace_manager=parsed.namespace_manager))
+    # The export adds at least the root rdf:type, so an empty graph means rdflib
+    # dropped the document; report it instead of exporting a "conforming" nothing.
+    if len(graph) == 0:
+        raise ValueError("JSON-LD interpretation of the document produced no RDF triples.")
     serialized = graph.serialize(
         format="json-ld",
         context=context_body,
@@ -480,6 +492,45 @@ def _list_terms(context_body: Any) -> frozenset[str]:
 
     visit(context_body)
     return frozenset(terms)
+
+
+def encode_iri_unsafe_ids(
+    *,
+    document: dict[str, Any],
+    id_keys: frozenset[str],
+) -> dict[str, Any]:
+    """Return a copy of ``document`` whose node ids are valid IRI references.
+
+    rdflib silently drops a node whose ``@id`` contains whitespace, a control
+    character or one of ``IRI_UNSAFE_CHARACTERS`` and, for the root node,
+    everything nested in it. Such characters (e.g. in model-generated ids) are
+    percent-encoded; valid ids are left unchanged.
+    """
+
+    copy = deepcopy(document)
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in id_keys and isinstance(item, str):
+                    value[key] = _encode_iri_unsafe_characters(item)
+                else:
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(copy)
+    return copy
+
+
+def _encode_iri_unsafe_characters(value: str) -> str:
+    return "".join(
+        quote(character, safe="")
+        if character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F or character in IRI_UNSAFE_CHARACTERS
+        else character
+        for character in value
+    )
 
 
 def assign_positional_ids(

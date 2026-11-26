@@ -1155,16 +1155,16 @@ class WorkflowService(
             warnings=warnings,
         )
 
-        if state.validation.status == "valid":
-            profile_document = await self._enrich_draft_with_requirements(
-                data_package_id=data_package_id,
-                profile_identifier=profile_identifier,
-                evidence_context=evidence_context,
-                validation_schema=validation_schema,
-                state=state,
-                progress=progress,
-                warnings=warnings,
-            )
+        profile_document = await self._enrich_valid_profile_draft(
+            document=profile_document,
+            data_package_id=data_package_id,
+            profile_identifier=profile_identifier,
+            evidence_context=evidence_context,
+            validation_schema=validation_schema,
+            state=state,
+            progress=progress,
+            warnings=warnings,
+        )
 
         progress.stage = "profile_draft"
         progress.interim_evidence_context = evidence_context
@@ -1427,16 +1427,16 @@ class WorkflowService(
                     warnings=warnings,
                 )
 
-                if state.validation.status == "valid":
-                    profile_document = await self._enrich_draft_with_requirements(
-                        data_package_id=data_package_id,
-                        profile_identifier=profile_identifier,
-                        evidence_context=evidence_context,
-                        validation_schema=validation_schema,
-                        state=state,
-                        progress=progress,
-                        warnings=warnings,
-                    )
+                profile_document = await self._enrich_valid_profile_draft(
+                    document=profile_document,
+                    data_package_id=data_package_id,
+                    profile_identifier=profile_identifier,
+                    evidence_context=evidence_context,
+                    validation_schema=validation_schema,
+                    state=state,
+                    progress=progress,
+                    warnings=warnings,
+                )
 
                 progress.stage = "profile_draft"
                 progress.interim_evidence_context = evidence_context
@@ -1791,16 +1791,16 @@ class WorkflowService(
             warnings=warnings,
         )
 
-        if state.validation.status == "valid":
-            profile_document = await self._enrich_draft_with_requirements(
-                data_package_id=data_package_id,
-                profile_identifier=profile_identifier,
-                evidence_context=evidence_context,
-                validation_schema=validation_schema,
-                state=state,
-                progress=progress,
-                warnings=warnings,
-            )
+        profile_document = await self._enrich_valid_profile_draft(
+            document=profile_document,
+            data_package_id=data_package_id,
+            profile_identifier=profile_identifier,
+            evidence_context=evidence_context,
+            validation_schema=validation_schema,
+            state=state,
+            progress=progress,
+            warnings=warnings,
+        )
 
         if target_stage == "profile":
             progress.stage = "profile_draft"

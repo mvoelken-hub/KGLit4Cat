@@ -53,6 +53,7 @@ class EvidenceService:
                 summaries=persisted_state.initial_file_summaries,
                 status=persisted_state.initial_file_summary_status,
                 ranking=ranking,
+                progress=persisted_state.initial_file_summary_progress,
             )
             and self._initial_overview_matches_current_run(
                 overview=persisted_state.initial_extraction_overview,

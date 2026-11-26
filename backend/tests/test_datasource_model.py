@@ -233,6 +233,54 @@ class DataPackageTests(unittest.TestCase):
         self.assertIn("Sheet1/1: sample", extracted)
         self.assertIn("sample,42", extracted)
 
+    def test_extract_text_from_csv_with_semicolons_and_decimal_commas(self):
+        extracted = extract_text_from_file(
+            content=b"2 theta;intensity\n2;26463\n2,015;26349\n2,03;26776\n2,045;26041\n",
+            file_name="pxrd.csv",
+        )
+
+        self.assertIn("Sheet1/1: pxrd", extracted)
+        self.assertIn("2 theta,intensity", extracted)
+        # Decimal commas are parsed as numbers, so inner numeric rows are compressed.
+        self.assertIn("2.0,26463", extracted)
+        self.assertIn("2.045,26041", extracted)
+        self.assertNotIn("2.015", extracted)
+
+    def test_extract_text_from_csv_keeps_metadata_preamble_and_uses_hash_header(self):
+        content = (
+            "#FORMAT:          ;NETZSCH5\n"
+            "#INSTRUMENT:      ;NETZSCH STA 409 C/CD\n"
+            "#SAMPLE MASS /mg: ;73,900\n"
+            "\n"
+            "##Temp./\xb0C;Time/min;Mass/%;Sensit./(\xb5V/mW)\n"
+            " 30,692;0,0000e+000;100,00000;1,0\n"
+            " 35,692;    4,38163;100,46035;1,0\n"
+            " 40,692;    5,62969;100,57389;1,0\n"
+        ).encode("cp1252")
+
+        extracted = extract_text_from_file(content=content, file_name="TG DTA.csv")
+
+        self.assertIn("#INSTRUMENT:      ;NETZSCH STA 409 C/CD", extracted)
+        self.assertIn("#SAMPLE MASS /mg: ;73,900", extracted)
+        # Windows-1252 units survive decoding; the "##" line becomes the header.
+        self.assertIn("Temp./°C,Time/min,Mass/%,Sensit./(µV/mW)", extracted)
+        self.assertIn("30.692", extracted)
+
+    def test_extract_text_from_dos_code_page_csv_keeps_unit_symbols(self):
+        # NETZSCH-style export in code page 850: 0xF8 is "°", 0xE6 is "µ".
+        content = "##Temp./°C;Sensit./(µV/mW)\n 30,692;1,0\n 35,692;1,0\n".encode("cp850")
+
+        extracted = extract_text_from_file(content=content, file_name="tg.csv")
+
+        self.assertIn("Temp./°C,Sensit./(µV/mW)", extracted)
+
+    def test_unparsable_csv_falls_back_to_plain_text(self):
+        content = b'a,b\n1,"unterminated\n2,3\n'
+
+        extracted = extract_text_from_file(content=content, file_name="broken.csv")
+
+        self.assertIn("unterminated", extracted)
+
     def test_determine_file_type_accepts_dotless_extensions(self):
         self.assertEqual(determine_file_type("pdf"), FileType.PDF)
         self.assertEqual(determine_file_type("csv"), FileType.TABLE)
