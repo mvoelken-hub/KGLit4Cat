@@ -1369,6 +1369,93 @@ class WorkflowServiceWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await task_registry.wait_for_task("extraction:evidence:package-id:semantic:chat", timeout=2)
 
+    async def test_rejected_evidence_start_keeps_persisted_orientation(self):
+        service, task_registry, output_repository = make_service([[make_chunk()]])
+        persisted = output_repository.run_state
+        assert persisted is not None
+        # The overview lists the ranked files in another order, so the evidence
+        # start treats the orientation as stale and rejects the run.
+        persisted.ranked_files = [
+            RankedFile(rank=1, file_path="README.md"),
+            RankedFile(rank=2, file_path="data.csv"),
+        ]
+        persisted.initial_file_summaries = [
+            ExtractionFileSummary(
+                file_path=file_path,
+                data_format="text",
+                explicit_purpose="",
+                information_summary=f"{file_path} is present.",
+            )
+            for file_path in ("README.md", "data.csv")
+        ]
+        persisted.initial_extraction_overview = overview_for_file(
+            source_fingerprint="overview",
+        ).model_copy(update={"source_file_paths": ["data.csv", "README.md"]})
+        before = persisted.model_copy(deep=True)
+
+        await service.run_extraction(
+            data_package_id="package-id",
+            profile_identifier="profile",
+        )
+        with self.assertRaisesRegex(ValueError, "Run initial file understanding"):
+            await task_registry.wait_for_task("extraction:evidence:package-id:semantic:chat", timeout=2)
+
+        after = output_repository.run_state
+        assert after is not None
+        self.assertEqual(after.ranked_files, before.ranked_files)
+        self.assertEqual(after.initial_file_summaries, before.initial_file_summaries)
+        self.assertEqual(after.initial_file_summary_status, "completed")
+        self.assertEqual(after.initial_extraction_overview, before.initial_extraction_overview)
+        self.assertEqual(after.initial_extraction_overview_status, "structured")
+
+    async def test_orientation_without_file_summaries_ranks_like_evidence_start(self):
+        service, _, _ = make_service([[make_chunk()]], with_initial_context=False)
+        data_package = DataPackage(
+            file_name="package",
+            files=[
+                FileEntry(
+                    file_path="NMR.jdx",
+                    file_name="NMR.jdx",
+                    file_extension=".jdx",
+                    raw_content=b"##TITLE= spectrum\n" * 10_000,
+                ),
+                FileEntry(
+                    file_path="NMR_copy_for_metadata_extraction.txt",
+                    file_name="NMR_copy_for_metadata_extraction.txt",
+                    file_extension=".txt",
+                    raw_content=b"metadata",
+                ),
+            ],
+        )
+
+        # All file summaries failed: orientation must still produce the ranking
+        # an evidence start computes, and order its overview files by it.
+        ranking = service._rank_files_from_summaries(
+            data_package=data_package,
+            state=ExtractionRunState(initial_file_summaries=[]),
+        )
+        evidence_ranking = await service._rank_files("package-id", data_package, [])
+        previews = service._initial_overview_file_previews(
+            data_package=data_package,
+            ranking=ranking,
+        )
+        overview = overview_for_file().model_copy(
+            update={"source_file_paths": [preview.file_path for preview in previews]}
+        )
+
+        self.assertEqual(
+            [file.file_path for file in ranking.files],
+            [file.file_path for file in evidence_ranking.files],
+        )
+        self.assertEqual(ranking.files[0].file_path, "NMR_copy_for_metadata_extraction.txt")
+        self.assertTrue(
+            service._initial_overview_matches_current_run(
+                overview=overview,
+                status="structured",
+                ranking=evidence_ranking,
+            )
+        )
+
     async def test_initial_overview_previews_use_ranked_top_files_and_raw_first_lines(self):
         service, _, _ = make_service([[make_chunk()]])
         data_package = DataPackage(

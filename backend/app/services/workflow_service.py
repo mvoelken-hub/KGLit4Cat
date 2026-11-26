@@ -1319,17 +1319,6 @@ class WorkflowService(
         )
         if force_profile_rebuild and target_stage in {"profile", "grounding", "complete"}:
             self._clear_profile_projection_progress(progress)
-            self._clear_prompt_diagnostics(
-                data_package_id,
-                stage="profile_draft",
-                chunking_strategy=chunking_strategy,
-                chat_model=chat_model,
-            )
-            self._clear_profile_projection_token_usage(
-                data_package_id,
-                chunking_strategy=chunking_strategy,
-                chat_model=chat_model,
-            )
         self._update_progress(data_package_id, progress)
 
         if persisted_state and persisted_state.ranked_files:
@@ -1352,7 +1341,35 @@ class WorkflowService(
             chunk_repair_mode=chunk_repair_mode,
             evidence_critic_granularity=evidence_critic_granularity,
         )
+        if (
+            state.initial_file_summary_status is None
+            or state.initial_extraction_overview_status is None
+        ):
+            # Reject before anything is saved or cleared: the prepared state drops
+            # an orientation that does not match the current file ranking, and
+            # saving it would wipe the persisted orientation context.
+            progress.stage = "initial_context_required"
+            progress.warnings = [
+                *warnings,
+                "Run initial file understanding before chunk extraction.",
+            ]
+            self._update_progress(data_package_id, progress)
+            raise ValueError(
+                "Run initial file understanding before chunk extraction."
+            )
+
         if force_profile_rebuild and target_stage in {"profile", "grounding", "complete"}:
+            self._clear_prompt_diagnostics(
+                data_package_id,
+                stage="profile_draft",
+                chunking_strategy=chunking_strategy,
+                chat_model=chat_model,
+            )
+            self._clear_profile_projection_token_usage(
+                data_package_id,
+                chunking_strategy=chunking_strategy,
+                chat_model=chat_model,
+            )
             self._clear_profile_projection_state(state)
             self._clear_profile_stage_documents(data_package_id, state)
         self._save_run_state(data_package_id, state)
@@ -1380,21 +1397,6 @@ class WorkflowService(
         progress.processed_chunks = self._completed_chunk_count(state)
         progress.interim_evidence_context = self._merged_completed_evidence_context_or_none(state)
         self._update_progress(data_package_id, progress)
-
-        if (
-            state.initial_file_summary_status is None
-            or state.initial_extraction_overview_status is None
-        ):
-            progress.stage = "initial_context_required"
-            progress.warnings = [
-                *warnings,
-                "Run initial file understanding before chunk extraction.",
-            ]
-            self._save_run_state(data_package_id, state)
-            self._update_progress(data_package_id, progress)
-            raise ValueError(
-                "Run initial file understanding before chunk extraction."
-            )
 
         if force_profile_rebuild and target_stage == "profile":
             evidence_context = self._load_evidence_context_or_none(

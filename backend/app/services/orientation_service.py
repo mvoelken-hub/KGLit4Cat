@@ -43,10 +43,16 @@ class OrientationService:
             )
             for file in data_package.files
         }
-        return rank_summarized_files(
+        ranking = rank_summarized_files(
             state.initial_file_summaries,
             file_contexts=file_contexts,
         )
+        if ranking.files:
+            return ranking
+        # Without any file summary, rank like an evidence start does (_rank_files);
+        # an empty ranking would order the overview by inventory instead, so a
+        # later evidence start would not match it and reject the orientation.
+        return fallback_file_ranking(list(file_contexts.values()))
 
     async def _generate_initial_file_summaries(
         self,
